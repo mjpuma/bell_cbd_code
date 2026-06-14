@@ -1,0 +1,5 @@
+wrds
+pandas
+numpy
+pyarrow
+matplotlib

@@ -1,0 +1,493 @@
+\documentclass[11pt]{article}
+
+% ======================================================================
+%  CbD analysis of S&P 500 (WRDS/CRSP) crisis periods.
+%  Full mathematics + layman boxes. Compiles with pdflatex.
+% ======================================================================
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[a4paper,margin=0.86in]{geometry}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{xcolor}
+\usepackage[most]{tcolorbox}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=blue!45!black,urlcolor=blue!45!black}
+
+% ---------------------- callout boxes ---------------------------------
+\definecolor{laymanblue}{RGB}{215,232,252}
+\definecolor{laymanframe}{RGB}{60,120,200}
+\definecolor{mathgreen}{RGB}{228,248,228}
+\definecolor{mathgreenframe}{RGB}{40,140,40}
+\definecolor{warnbg}{RGB}{255,244,215}
+\definecolor{warnframe}{RGB}{190,130,0}
+
+\newtcolorbox{intuition}[1][In plain terms]{
+  enhanced, breakable, colback=laymanblue, colframe=laymanframe,
+  fonttitle=\bfseries\small, coltitle=white, title={$\bigstar$\enspace #1},
+  boxrule=1pt, arc=3pt, left=6pt, right=6pt, top=4pt, bottom=4pt,
+  before skip=7pt, after skip=7pt}
+
+\newtcolorbox{derivationbox}[1][Derivation]{
+  enhanced, breakable, colback=mathgreen, colframe=mathgreenframe,
+  fonttitle=\bfseries\small, coltitle=white, title={$\Sigma$\enspace #1},
+  boxrule=1pt, arc=3pt, left=6pt, right=6pt, top=4pt, bottom=4pt,
+  before skip=7pt, after skip=7pt}
+
+\newtcolorbox{cautionbox}[1][Caveat]{
+  enhanced, breakable, colback=warnbg, colframe=warnframe,
+  fonttitle=\bfseries\small, coltitle=white, title={$\triangle$\enspace #1},
+  boxrule=1pt, arc=3pt, left=6pt, right=6pt, top=4pt, bottom=4pt,
+  before skip=7pt, after skip=7pt}
+
+\newcommand{\sgn}{\operatorname{sgn}}
+\newcommand{\ind}[1]{\mathbf{1}\!\left\{#1\right\}}
+\newcommand{\E}[1]{\langle ab\rangle_{#1}}
+\newcommand{\sodd}{s_{\mathrm{odd}}}
+
+\title{\textbf{Contextuality-by-Default Analysis of S\&P 500 Crisis Periods}\\[4pt]
+\large Design, Mathematics, and the Post-Selection Interpretation\\
+\normalsize CRSP/WRDS daily data}
+\author{\small Bell\,/\,stocks project --- analysis specification}
+\date{\small\today}
+
+\begin{document}
+\maketitle
+
+% ======================================================================
+\section{Objective and framing}
+% ======================================================================
+
+This document specifies a complete Contextuality-by-Default (CbD) analysis of S\&P~500
+constituent pairs over crisis and calm periods, using CRSP daily data from WRDS. The analysis
+has three deliverables:
+\begin{enumerate}[leftmargin=1.6em,itemsep=1pt]
+  \item a working CbD pipeline layered on the existing four-$S$ (CHSH) machinery;
+  \item a \emph{deflation result}: a demonstration that apparent Bell-type violations in
+        equity data are reproducible by classical processes once the endogenous definition of
+        the measurement contexts is accounted for; and
+  \item a \emph{behavioral characterization}: how the dependence structure differs between
+        crisis and calm regimes --- the aggregate System-1/System-2 contrast --- stated as
+        classical regime-dependence, not contextuality.
+\end{enumerate}
+
+\begin{intuition}[What we are testing, and what we are not]
+We are \emph{not} hunting for ``quantum stocks.'' The structural problem (\S\ref{sec:postsel})
+is that in market data the measurement \emph{conditions} are computed from the same numbers as
+the measurement \emph{outcomes} --- like labeling years ``drought years'' using the harvest
+itself and then claiming drought explains the harvest. Because of this, a positive
+contextuality score here cannot certify anything non-classical. The goals are therefore to show
+this explicitly, quantify it, and extract the real (classical) crisis/calm structure --- while
+the genuine contextuality question is reserved for decision experiments where conditions are
+set externally.
+\end{intuition}
+
+% ======================================================================
+\section{Data: CRSP via WRDS (build plan)}
+% ======================================================================
+
+This is a verified, build-ready specification. Two practical facts dominate it. First, the
+historical S\&P~500 constituent list is \emph{no longer available through Compustat}: S\&P
+withdrew the old \texttt{comp.idxcst\_his} table from WRDS, so index membership must now come
+from CRSP. Second, CRSP migrated to its Flat File Format 2.0 (``CIZ'') in 2022; the legacy
+(SIZ/FIZ) tables were frozen after the December~2024 data cut, and the CIZ \texttt{\_v2} tables
+are the sole forward source. All table names below are the current CIZ ones.
+
+\begin{cautionbox}[Two routes that will silently fail]
+(1)~\texttt{comp.idxcst\_his} --- the old Compustat index-constituents table; S\&P pulled it
+from the WRDS platform, so it no longer returns S\&P~500 membership. Use the CRSP list instead.
+(2)~Legacy CRSP tables \emph{without} the \texttt{\_v2} suffix are frozen at the December~2024
+cut and receive no new data; any sample reaching past 2024 must use the \texttt{\_v2} (CIZ)
+tables. Both failure modes are quiet --- empty or stale results, not errors.
+\end{cautionbox}
+
+\textbf{Access.} Use the \texttt{wrds} Python package over the WRDS PostgreSQL connection; every
+query below is a \texttt{db.raw\_sql(\dots)} call. Because CIZ renamed many columns, confirm
+exact field names once with \texttt{db.describe\_table(...)} before relying on them.
+\begin{verbatim}
+    import wrds
+    db = wrds.Connection(wrds_username="...")   # one-time .pgpass setup
+    db.list_libraries()                         # confirm access
+    db.describe_table("crsp", "dsf_v2")         # confirm CIZ column names
+\end{verbatim}
+
+\subsection{Point-in-time S\&P 500 membership}
+Historical members of the index (SPX) are in \texttt{crsp.dsp500list\_v2} (daily; the
+schema-qualified form is \texttt{crsp\_a\_indexes.dsp500list\_v2}). Each row is one membership
+spell: \texttt{permno}, \texttt{mbrstartdt} (member start date), \texttt{mbrenddt} (member end
+date). A security is a constituent on date $D$ iff
+$\texttt{mbrstartdt}\le D\le\texttt{mbrenddt}$.
+\begin{verbatim}
+    spx = db.raw_sql("""
+        select permno, mbrstartdt, mbrenddt
+        from crsp.dsp500list_v2
+    """)
+\end{verbatim}
+Applying this spell logic to \emph{each} window so the universe is the index composition
+\emph{as of that date} is what removes survivorship and look-ahead bias --- using today's index
+to study 2008 would silently condition on survival.
+
+\begin{cautionbox}[Membership-date conventions (subtle, costly to miss)]
+The end date of a \emph{currently active} member defaults to the last trading day of the latest
+data cut and is revised forward at each annual update --- so current membership is
+right-censored, not permanent. Because the list is daily, a membership test written against a
+\emph{non-trading} day (e.g.\ Dec~31) can return nothing; anchor tests to trading days. Always
+join on \texttt{permno}, never on ticker: tickers are reused and reassigned (Facebook$\to$Meta
+is one of many).
+\end{cautionbox}
+
+\subsection{Daily returns and identifiers}
+Daily returns are in \texttt{crsp.dsf\_v2} (the CIZ daily stock file), keyed by \texttt{permno}
+and \texttt{date}. The holding-period return \texttt{ret} is adjusted for splits and
+distributions, and --- a change from the legacy workflow --- in CIZ the \emph{delisting return is
+already folded into the main return series}, so no separate delisting-file merge is required.
+\begin{verbatim}
+    ret = db.raw_sql("""
+        select permno, date, ret, prc, vol, shrout
+        from crsp.dsf_v2
+        where date between '1990-01-01' and '2025-12-31'
+          and permno in ( ... )       -- constituent PERMNOs for the window
+    """)
+\end{verbatim}
+\textbf{Identifiers.} \texttt{permno} (permanent \emph{security} id) is the join key
+everywhere; \texttt{permco} (permanent \emph{company} id) is used to avoid treating two share
+classes of the same firm as an independent pair. \textbf{Universe filter.} The common-stock
+screen (historically share codes 10/11 and exchange codes 1--3 = NYSE/AMEX/Nasdaq) now lives in
+\texttt{crsp.stksecurityinfohist} under renamed CIZ fields (\texttt{sharetype},
+\texttt{securitytype}, \texttt{primaryexch}, \dots); take the exact code values from the CRSP
+CIZ cross-reference guide. For an S\&P~500-only study this screen is rarely binding (members are
+common stock), but it matters if the universe is later broadened.
+
+\subsection{Building the pair universe and data volume}
+Per window: (i)~resolve constituent PERMNOs as of the window start via the spell logic;
+(ii)~pull their daily \texttt{ret}; (iii)~form all unordered pairs. With $\sim$500 names a
+window holds $\binom{500}{2}\approx1.25\times10^5$ pairs; across $\sim$420 monthly windows
+(1990--present) that is $\sim$$5\times10^7$ pair-windows --- large but tractable. Cache the daily
+return panel once (a few GB), compute each window vectorized over the return matrix, and persist
+only the per-pair summaries ($\sodd,\Delta,\mathrm{CTX}$, the four cell counts), not the raw
+cells. Membership churns by $\sim$20--30 names/year, so the universe is genuinely time-varying;
+resolving it per window is mandatory, not a refinement.
+
+\subsection{Continuous co-membership (pair eligibility)}
+A pair contributes to a window only when \emph{both} names are constituents on that window's
+trading days. Because membership turns over ($\sim$20--30 names/year, elevated in crises through
+forced deletions), a naive construction would (i)~allow a pair's composition to change
+\emph{within} a window when a name enters or exits mid-window --- contaminating the very
+correlations being measured --- and (ii)~admit short-lived pairs whose mere availability is
+correlated with the regime, a second-order echo of the endogeneity this analysis targets. We
+therefore impose \textbf{continuous co-membership}: a pair $(A,B)$ is eligible for a window only
+if both $A$ and $B$ are constituents for the \emph{entire} window (strict rule; a
+$\ge\!95\%$-of-window-trading-days threshold is the permissive variant), with the co-membership
+span recorded.
+
+\begin{cautionbox}[Status of this rule: a standard principle, not a branded method]
+There is no single citable ``continuous co-membership'' rule, and it would be an overstatement
+to present one. What \emph{is} standard is its two ingredients, combined: (i)~a
+\emph{traded-throughout eligibility screen} --- the formation/trading design of Gatev, Goetzmann
+\& Rouwenhorst (2006), and the explicit requirement in later work that a security be present for
+the whole formation window to be eligible (reviewed in Krauss 2017); and (ii)~\emph{point-in-time}
+constituent reconstruction to remove survivorship and look-ahead bias. Our rule is exactly
+(i)+(ii) applied to \emph{index membership} and to \emph{pairs}, rather than to single-stock
+trading. Framing it this way is both defensible and accurate.
+\end{cautionbox}
+
+\subsection{Crisis dating (kept external to the pair)}
+Window labels come from indicators \emph{outside} any pair's own returns:
+(i)~\textbf{implied volatility} --- the CBOE VIX level (high/low by a fixed or rolling
+threshold), available via WRDS (OptionMetrics) or directly from CBOE, and external to realized
+constituent returns; (ii)~\textbf{NBER recession dates} --- macroeconomic, fully exogenous to
+daily equity signs. The sample spans at least the 2000--02 dot-com unwind, the 2007--09
+financial crisis, the 2011 euro-area stress, the 2015--16 drawdown, the 2020 COVID crash, and
+the 2022 inflation/rates repricing.
+
+\begin{cautionbox}[Why crisis dating must be external to the pair]
+If the crisis label were computed from the same returns being analyzed, we would reproduce at
+the regime level exactly the self-referential flaw this analysis exposes at the daily level. VIX
+comes from S\&P index \emph{options} (a forward-looking, different instrument) and NBER dates
+from macroeconomic aggregates --- both external to any constituent pair's own daily return path.
+\end{cautionbox}
+
+\subsection{Cleaning and quality}
+(i)~Drop pair-days with a missing \texttt{ret} on either leg (halts, suspensions).
+(ii)~Define $\sgn(0)$ explicitly: exact-zero daily returns occur for thinly traded names; treat
+$\sgn(0)=0$ and exclude those days from the $\pm1$ series (or fix a convention) --- but be
+consistent and report it. (iii)~Flag and down-weight ultra-thin names (many zero-volume days):
+their signs are stale and inflate spurious agreement. (iv)~\texttt{ret} already incorporates
+splits and dividends, so do not re-adjust prices; note that a negative \texttt{prc} in CRSP is a
+quoted bid/ask midpoint (no closing trade), so use $|\texttt{prc}|$ if price is ever needed ---
+though the analysis uses only \texttt{ret}, which is unaffected.
+
+% ======================================================================
+\section{The cyclic-4 system on a stock pair}
+% ======================================================================
+
+\textbf{Outcomes and contexts.} For a pair $(A,B)$ and day $t$, the outcomes are the return
+signs $a_t=\sgn R_{A,t}$, $b_t=\sgn R_{B,t}\in\{-1,+1\}$. The context is the joint magnitude
+regime $(x,y)$, with $x=\ind{|R_{A,t}|\ge\theta_A}$ mapped to $\{0,1\}$ ($0=$ large-move,
+$1=$ small-move) and $y$ likewise for $B$. (The same construction runs with lagged-volatility
+regimes; the magnitude version is the sharpest case of the endogeneity and is therefore the
+right object for the deflation demonstration.)
+
+\textbf{Contents and connections.} In CbD language the system has four \emph{contents}
+(conceptual properties): $q_1=$ ``sign of $A$ when $A$ is in regime 0,'' $q_2=$ ``sign of $A$
+in regime 1,'' $q_3=$ ``sign of $B$ in regime 0,'' $q_4=$ ``sign of $B$ in regime 1.'' Each
+context $c_{xy}$ jointly measures one $A$-content and one $B$-content; each content appears in
+exactly two contexts. This is a cyclic system of rank $n=4$: the same algebraic shape as the
+CHSH experiment.
+
+\begin{intuition}[Bunches and connections, on a real pair]
+Take Deere (DE) and ADM --- two S\&P~500 names. Each trading day falls into one of four boxes,
+by whether each stock had a big or small move that day:
+\begin{center}\small
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{l|cc}
+ & \textbf{ADM big-move} & \textbf{ADM small-move}\\\hline
+\textbf{DE big-move}   & $\E{00}$ & $\E{01}$\\
+\textbf{DE small-move} & $\E{10}$ & $\E{11}$\\
+\end{tabular}
+\end{center}
+In each box we record one number: over the window, how often do DE and ADM move the
+\emph{same} direction on days that fall in that box. That single box --- two stocks measured
+together under one condition --- is a \emph{bunch}. Now notice that ``DE's direction on its
+big-move days'' appears in \emph{two} boxes (top row: ADM big, and ADM small). The comparison
+of DE's average direction between those two boxes is a \emph{connection}; the four such
+comparisons (two for DE, two for ADM) are exactly what $\Delta$ sums. Contextuality asks: can
+one consistent story of how DE and ADM behave fill all four boxes at once --- allowing each
+stock's average direction to drift a little between boxes (that drift is $\Delta$)? If yes, a
+single classical description covers everything; if the four boxes cannot be reconciled even
+after allowing the drift, the system is contextual.
+\end{intuition}
+
+\textbf{Empirical quantities.} Within each context $c_{xy}$, over a rolling window
+$\mathcal{W}$ of width $w$ days:
+\[
+  \widehat{\E{xy}}
+  =\frac{\sum_{t\in\mathcal{W}} a_t b_t\,\ind{(x_t,y_t)=(x,y)}}
+        {N_{xy}},
+  \qquad
+  \widehat{\langle a\rangle}_{xy}
+  =\frac{\sum_{t\in\mathcal{W}} a_t\,\ind{(x_t,y_t)=(x,y)}}{N_{xy}},
+\]
+with $N_{xy}$ the cell count, and $\widehat{\langle b\rangle}_{xy}$ analogously. Windows with
+$\min_{xy}N_{xy}<N_{\min}$ (we use $N_{\min}=10$) are excluded: small cells mechanically
+inflate the statistics.
+
+% ======================================================================
+\section{The CbD mathematics}
+% ======================================================================
+
+\subsection{The four CHSH combinations and \texorpdfstring{$\sodd$}{s\_odd}}
+
+\[
+  S_1=\E{00}+\E{01}+\E{10}-\E{11},\qquad
+  S_2=\E{00}+\E{01}-\E{10}+\E{11},
+\]
+\[
+  S_3=\E{00}-\E{01}+\E{10}+\E{11},\qquad
+  S_4=-\E{00}+\E{01}+\E{10}+\E{11},
+\]
+\[
+  \sodd \;=\; \max_{i\in\{1,\dots,4\}} |S_i|.
+\]
+Equivalently, $\sodd=\max\sum_{xy}\pm\E{xy}$ over sign patterns with an odd number of minus
+signs --- hence the name.
+
+\subsection{The inconsistency (direct-influence) term \texorpdfstring{$\Delta$}{Delta}}
+
+Each content appears in two contexts; its two versions may have different means. The total
+inconsistency is
+\[
+  \Delta
+  =\big|\langle a\rangle_{00}-\langle a\rangle_{01}\big|
+  +\big|\langle a\rangle_{10}-\langle a\rangle_{11}\big|
+  +\big|\langle b\rangle_{00}-\langle b\rangle_{10}\big|
+  +\big|\langle b\rangle_{01}-\langle b\rangle_{11}\big|.
+\]
+
+\begin{intuition}[What $\Delta$ measures]
+$\Delta$ asks: does merely \emph{being in a different condition} shift a stock's average
+up/down tendency? For example, does stock $A$ lean more negative on its large-move days than
+its small-move days? (It does --- big down-days are bigger than big up-days.) This is ordinary
+``the conditions differ'' behavior --- real, but shallow. CbD's point is that such shifts must
+be measured and budgeted for \emph{before} any claim of deep structure.
+\end{intuition}
+
+\subsection{The Kujala--Dzhafarov--Larsson criterion}
+
+For a cyclic system of rank $n$ with dichotomous outcomes, the system is noncontextual iff
+\[
+  \sodd \;\le\; (n-2) + \Delta \;\overset{n=4}{=}\; 2+\Delta,
+  \qquad\text{i.e.}\qquad
+  \boxed{\ \mathrm{CTX}\;\coloneqq\;\sodd-\Delta-2\;\le\;0.\ }
+\]
+$\mathrm{CTX}>0$ is the CbD definition of (true) contextuality. With consistent
+connectedness ($\Delta=0$) this is exactly CHSH with its classical bound 2; quantum systems
+reach $\sodd=2\sqrt2$; the algebraic maximum is 4.
+
+\begin{derivationbox}[Why the classical bound is $2$ at $\Delta=0$]
+Under a noncontextual (classical, common-description) model, all four contents have jointly
+distributed representatives $A_0,A_1,B_0,B_1\in\{-1,+1\}$ and $\E{xy}=\langle A_xB_y\rangle$.
+For any fixed realization, grouping the $S_1$ combination as
+$A_0(B_0+B_1)+A_1(B_0-B_1)$: one bracket is $\pm2$, the other $0$, so each realization
+contributes $\pm2$, and averaging gives $|S_1|\le2$; identically for $S_2,S_3,S_4$ (the single
+minus sign only relocates which bracket is the difference). The KDL result extends this to
+inconsistently connected systems: the achievable maximum of $\sodd$ under the best classical
+stitching rises by exactly the marginal slack, i.e.\ by $\Delta$.
+\end{derivationbox}
+
+\subsection{A number you can check by hand}
+
+\begin{derivationbox}[Watch the deflation happen]
+Suppose one window yields these four co-movement numbers and eight conditional averages
+(columns are the four regimes $00,01,10,11$):
+\begin{center}\small
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{l|cccc}
+ & $00$ & $01$ & $10$ & $11$\\\hline
+$\E{\cdot}$ \;(co-movement) & $+0.6$ & $+0.5$ & $+0.5$ & $-0.7$\\
+$\langle a\rangle$ \;(DE avg.\ direction) & $-0.20$ & $-0.05$ & $+0.05$ & $+0.10$\\
+$\langle b\rangle$ \;(ADM avg.\ direction) & $-0.15$ & $\phantom{+}0.00$ & $+0.05$ & $+0.10$\\
+\end{tabular}
+\end{center}
+The largest combination is $S_1=0.6+0.5+0.5-(-0.7)=2.3$, so $\sodd=2.3>2$: a na\"ive
+``violation.'' But the big-move cells lean negative (the leverage effect), so each stock's
+average direction drifts across its two boxes:
+\[
+  \Delta = \underbrace{|{-}0.20-({-}0.05)|}_{0.15}
+         + \underbrace{|0.05-0.10|}_{0.05}
+         + \underbrace{|{-}0.15-0.05|}_{0.20}
+         + \underbrace{|0.00-0.10|}_{0.10}
+         = 0.50.
+\]
+The corrected score is $\mathrm{CTX}=\sodd-\Delta-2 = 2.3-0.50-2 = -0.20 \le 0$:
+\emph{noncontextual}. The apparent violation was entirely the conditions shifting the averages
+--- ordinary direct influence --- now subtracted out. On the post-selected market data of
+\S\ref{sec:postsel} this deflation is the generic outcome.
+\end{derivationbox}
+
+% ======================================================================
+\section{The post-selection no-go for market data}\label{sec:postsel}
+
+The system above is structurally well-formed --- it \emph{is} a cyclic-4 system. The
+obstruction to interpreting $\mathrm{CTX}>0$ as non-classicality is that the contexts are
+defined by conditioning on $(|R_{A}|,|R_{B}|)$, which are functions of the very returns whose
+signs are the outcomes. The context is therefore \emph{post-selected on an outcome-correlated
+variable} --- the detection-loophole / measurement-dependence configuration. The classical
+bound presumes contexts assigned independently of the system (``fair sampling''); that
+presumption fails here by construction.
+
+\begin{derivationbox}[A classical joint that reaches $\mathrm{CTX}>0$, indeed $\sodd=4$]
+Construct a distribution for $(R_A,R_B)$ as follows. Let the magnitude pair
+$(|R_A|,|R_B|)$ place positive probability on all four regime cells. Conditional on the cell,
+draw the sign pair $(a,b)$ with marginals $\langle a\rangle_{xy}=\langle b\rangle_{xy}=0$ in
+every cell (so $\Delta=0$ identically) and correlations
+\[
+  \E{00}=\E{01}=\E{10}=+c,\qquad \E{11}=-c,\qquad c\in(0,1].
+\]
+Unbiased $\pm1$ pairs with any prescribed correlation exist (mass
+$\tfrac{1+c}{4}$ on equal signs, $\tfrac{1-c}{4}$ on opposite, etc.), so this is a valid,
+purely classical joint distribution over $(R_A,R_B)$. Then
+\[
+  S_1=3c-(-c)=4c,\qquad \Delta=0,\qquad \mathrm{CTX}=4c-2>0\ \ \text{for } c>\tfrac12,
+\]
+reaching the algebraic maximum $\sodd=4$ at $c=1$ --- beyond the Tsirelson bound $2\sqrt2$,
+which no genuine quantum system can exceed. A fully classical process did this. Hence
+$\mathrm{CTX}>0$ on regime-sorted market data certifies nothing.
+\end{derivationbox}
+
+\begin{intuition}[Why $\Delta$ cannot rescue the test here]
+$\Delta$ is a \emph{first-moment} correction: it budgets for the conditions shifting each
+stock's \emph{average} tendency. But sorting days by move size distorts the
+\emph{co-movement pattern} between the stocks at fixed averages --- a second-moment effect
+that $\Delta$ never sees. In the construction above the averages are perfectly clean
+($\Delta=0$) while the sorting drives the score to its arithmetic ceiling. The leak is in the
+correlations, not the marginals, so the marginal correction cannot plug it.
+\end{intuition}
+
+\begin{cautionbox}[The two preconditions, and where they fail]
+A CbD verdict reads as non-classicality only if (A) contexts are \emph{exogenous} ---
+assigned independently of the measured system (measurement independence); and (B)
+non-co-measurability arises from genuine \emph{disturbance}, not from \emph{selection}.
+Observational equity data fails both: (A) the regimes are computed from the returns; (B) a
+day sits in exactly one magnitude cell by sorting, not because measuring one content
+physically precludes another. Designed decision experiments satisfy both, which is why true
+contextuality has been demonstrated there (Cervantes--Dzhafarov 2018; Basieva et al.\ 2019)
+and cannot be certified here.
+\end{cautionbox}
+
+% ======================================================================
+\section{The analysis pipeline}
+% ======================================================================
+
+\textbf{Step 1 --- Estimation.} For every constituent pair and rolling window
+($w=60$ trading days, stepped monthly; $\theta$ at the per-stock rolling median of $|R|$,
+with fixed-quantile robustness sweeps): compute the four $\widehat{\E{xy}}$, the eight
+conditional marginals, $\sodd$, $\Delta$, and $\mathrm{CTX}=\sodd-\Delta-2$. Record
+$(N_{00},N_{01},N_{10},N_{11})$ and enforce $N_{\min}$.
+
+\textbf{Step 2 --- Crisis/calm split.} Label each window crisis or calm by the external
+indicator (\S2). Report, separately by regime: the cross-sectional distribution of $\sodd$,
+$\Delta$, $\mathrm{CTX}$; the proportion of pairs with $\sodd>2$ (the na\"ive ``violation
+rate''); and the proportion with $\mathrm{CTX}>0$ (the CbD-corrected rate).
+
+\textbf{Step 3 --- The deflation demonstration (the central result).} Fit a classical
+generator to each window: a two-state regime-switching model for magnitudes with a
+sign-correlation that depends on the magnitude state (capturing crisis-coupling), plus an
+asymmetric magnitude--sign link (capturing the leverage effect); no contextual ingredient
+anywhere. Simulate, push through the identical pipeline, and compare the simulated and
+empirical $(\sodd,\Delta,\mathrm{CTX})$ distributions. \emph{Reproduction} establishes the
+artifact reading. Any empirical corner the classical generator cannot reach --- after the
+controls below --- is flagged, not celebrated: the presumption remains artifact until the
+generator class is shown inadequate.
+
+\textbf{Step 4 --- Exogenous-context contrast.} Recompute with contexts defined by variables
+\emph{not} derived from the pair's own returns: (i) the day's VIX level (high/low by rolling
+median); (ii) scheduled macro-announcement days vs.\ ordinary days. Attenuation of
+$\mathrm{CTX}$ under exogenous contexts is direct evidence that the endogenous sorting was the
+source. (These contexts are shared, $x=y$, which empties the off-diagonal cells; the
+comparison therefore uses the diagonal-cell statistics.)
+
+\textbf{Step 5 --- Controls.} (i) Permutation placebo: shuffle regime labels within windows;
+the $\mathrm{CTX}$ distribution must collapse below 0. (ii) Small-sample null: simulate
+i.i.d.\ signs through the pipeline to quantify finite-$N$ inflation of $\sodd$.
+(iii) Multiple comparisons: with $\sim$125{,}000 pairs per window, control the family-wise
+rate (max-statistic permutation) before calling any single pair noteworthy.
+(iv) Sector stratification: report Steps 2--3 within GICS sectors; concentrations are
+candidates for the food-system follow-on, not contextuality claims.
+
+\begin{intuition}[How to read the final table]
+The headline exhibit is a two-row table --- crisis vs.\ calm --- with columns: na\"ive
+violation rate ($\sodd>2$), CbD-corrected rate ($\mathrm{CTX}>0$), and the classical
+simulator's matched rates. The expected pattern: the na\"ive rate is substantial and much
+higher in crisis; the corrected rate is far smaller; and the simulator reproduces both. That
+pattern, with the \S\ref{sec:postsel} construction beside it, \emph{is} the deflation result:
+the crisis signal is real but classical --- stronger regime-dependent coupling --- and the
+quantum-looking excess is the sorting artifact.
+\end{intuition}
+
+% ======================================================================
+\section{Outputs and connection to the program}
+% ======================================================================
+
+Deliverables: (1) the pipeline (extending the four-$S$ codebase); (2) the deflation paper
+exhibit set --- the table above, the $\mathrm{CTX}$ distributions, the classical-reproduction
+overlay, and the exogenous-context contrast; (3) the crisis/calm behavioral characterization
+($\Delta$, regime correlations, and their sector structure) as the aggregate
+System-1/System-2 contrast, stated classically. The certifiable-contextuality question
+proceeds in the decision/evacuation track, where contexts are experimenter-set and
+incompatibility is genuine disturbance; this analysis is that track's methodological floor
+and its motivating contrast.
+
+\smallskip
+\noindent\textbf{References} {\small(verified):} Kujala, Dzhafarov \& Larsson,
+\emph{Phys.\ Rev.\ Lett.}\ \textbf{115}, 150401 (2015). \;Cervantes \& Dzhafarov,
+\emph{Decision} \textbf{5}, 193--204 (2018). \;Basieva, Cervantes, Dzhafarov \& Khrennikov,
+\emph{J.\ Exp.\ Psychol.: General} \textbf{148}, 1925--1937 (2019). \;Dzhafarov, Zhang \&
+Kujala, \emph{Phil.\ Trans.\ R.\ Soc.\ A} \textbf{374}, 20150099 (2016).
+\;\emph{Pair-eligibility methodology (confirm pagination):} Gatev, Goetzmann \& Rouwenhorst,
+\emph{Rev.\ Financ.\ Stud.}\ \textbf{19}, 797--827 (2006); Krauss, \emph{J.\ Econ.\ Surveys}
+\textbf{31}, 513--545 (2017).
+
+\end{document}

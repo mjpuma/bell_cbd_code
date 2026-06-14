@@ -1,0 +1,21 @@
+# credentials & secrets
+.pgpass
+*.pgpass
+.env
+
+# extracted data (re-pullable; do not commit)
+data/
+*.parquet
+*.csv
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# figures (regenerable from the parquet via src/plots.py)
+figures/
+
+# macOS
+.DS_Store
