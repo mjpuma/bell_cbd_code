@@ -464,6 +464,131 @@ def plot_ctx_overlay(stats: pd.DataFrame, null_stats: Optional[pd.DataFrame]) ->
 
 
 # ==========================================================================
+# AGGREGATE-FED variants for the full-span (--partition) run, where the
+# ~5e7-row pair-window frame is never materialized. These consume the compact
+# aggregates emitted by cbd_analysis.analyze_streaming.
+# ==========================================================================
+def _hist_step(ax, edges_left, edges_right, counts, color, label):
+    """Draw a density step histogram from precomputed bin counts."""
+    counts = np.asarray(counts, dtype=float)
+    widths = np.asarray(edges_right) - np.asarray(edges_left)
+    total = counts.sum()
+    dens = counts / (total * widths) if total > 0 else counts
+    centers = (np.asarray(edges_left) + np.asarray(edges_right)) / 2
+    ax.step(centers, dens, where="mid", color=color, label=label, lw=1.6)
+    ax.fill_between(centers, dens, step="mid", color=color, alpha=0.3)
+
+
+def plot_statistic_distributions_agg(stat_hist: pd.DataFrame) -> Figure:
+    """fig (f) from streamed per-(var,regime) histograms."""
+    name = "fig_f_statistic_distributions"
+    if _missing(stat_hist, ("var", "regime", "bin_left", "bin_right", "count"), name):
+        return _placeholder("s_odd / delta / ctx distributions", "stat_hist aggregate missing")
+    quantities = [("s_odd", r"$s_{\mathrm{odd}}$", 2.0),
+                  ("delta", r"$\Delta$", None),
+                  ("ctx", r"CTX $=s_{\mathrm{odd}}-\Delta-2$", 0.0)]
+    fig, axes = plt.subplots(1, 3, figsize=(13, 4.3))
+    for ax, (col, lab, ref) in zip(axes, quantities):
+        sub = stat_hist[stat_hist["var"] == col]
+        for gname in ("crisis", "calm"):
+            g = sub[sub["regime"] == gname].sort_values("bin_left")
+            if g.empty or g["count"].sum() == 0:
+                continue
+            _hist_step(ax, g["bin_left"], g["bin_right"], g["count"],
+                       REGIME_COLORS.get(gname, OKABE["blue"]), gname)
+        if ref is not None:
+            ax.axvline(ref, color=OKABE["black"], ls="--", lw=1.2)
+        ax.set_title(lab); ax.set_xlabel(lab); ax.set_ylabel("density")
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend()
+    fig.suptitle("Cross-sectional CbD statistics by regime", fontweight="bold")
+    _caption(fig, "Full-span streamed histograms (per-pair frame never materialized).")
+    fig.tight_layout(rect=(0, 0.03, 1, 0.96))
+    return fig
+
+
+def plot_violation_rates_agg(headline: pd.DataFrame) -> Figure:
+    """fig (g) from the per-regime running tallies."""
+    name = "fig_g_violation_rates"
+    if _missing(headline, ("regime", "n_valid", "naive_rate", "cbd_rate"), name):
+        return _placeholder("Violation rates", "headline_rates aggregate missing")
+    order = {"crisis": 0, "calm": 1}
+    r = headline.sort_values("regime", key=lambda s: s.map(lambda x: order.get(x, 9)))
+    x = np.arange(len(r)); w = 0.38
+    fig, ax = plt.subplots()
+    ax.bar(x - w / 2, 100 * r["naive_rate"], w, color=OKABE["vermillion"],
+           label=r"naive  ($s_{\mathrm{odd}}>2$)")
+    ax.bar(x + w / 2, 100 * r["cbd_rate"], w, color=OKABE["blue"],
+           label=r"CbD-corrected  (CTX$>0$)")
+    for i, (_, row) in enumerate(r.iterrows()):
+        ax.text(i - w / 2, 100 * row["naive_rate"], f"{100*row['naive_rate']:.2f}%",
+                ha="center", va="bottom", fontsize=10)
+        ax.text(i + w / 2, 100 * row["cbd_rate"], f"{100*row['cbd_rate']:.2f}%",
+                ha="center", va="bottom", fontsize=10)
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"{g}\n(N={int(n):,})" for g, n in zip(r["regime"], r["n_valid"])])
+    ax.set_ylabel("Share of pairs (%)")
+    ax.set_title("Deflation: naive violation rate vs CbD-corrected rate")
+    ax.legend(loc="upper right")
+    _caption(fig, "Full-span running tallies; CTX>0 collapses the naive rate -- the deflation.")
+    fig.tight_layout(rect=(0, 0.03, 1, 1))
+    return fig
+
+
+def plot_cell_counts_agg(cell_summary: pd.DataFrame) -> Figure:
+    """fig (d) from streamed mean per-cell sample sizes."""
+    name = "fig_d_cell_counts"
+    cells = ["N00", "N01", "N10", "N11"]
+    if _missing(cell_summary, cells, name):
+        return _placeholder("Four-cell counts", "cell_summary aggregate missing")
+    labels = ["N00\n(lg,lg)", "N01\n(lg,sm)", "N10\n(sm,lg)", "N11\n(sm,sm)"]
+    fig, ax = plt.subplots()
+    regimes = list(cell_summary["regime"]) if "regime" in cell_summary.columns else ["all"]
+    x = np.arange(len(cells)); w = 0.8 / max(1, len(regimes))
+    for k, (_, row) in enumerate(cell_summary.iterrows()):
+        vals = [row[c] for c in cells]
+        ax.bar(x + (k - (len(regimes) - 1) / 2) * w, vals, w,
+               color=REGIME_COLORS.get(row.get("regime", "all"), OKABE["skyblue"]),
+               label=str(row.get("regime", "all")))
+    ax.axhline(10, color=OKABE["black"], ls="--", lw=1.0, label="N_min=10")
+    ax.set_xticks(x); ax.set_xticklabels(labels)
+    ax.set_title("Mean per-cell sample size across valid pairs")
+    ax.set_ylabel("Mean count per cell (days)"); ax.set_xlabel("Magnitude cell (A,B)")
+    ax.legend(loc="upper right")
+    _caption(fig, "All four cells sit above N_min at the canonical theta -- E00 is well-populated.")
+    fig.tight_layout(rect=(0, 0.03, 1, 1))
+    return fig
+
+
+def plot_ctx_overlay_agg(stat_hist: pd.DataFrame,
+                         null_hist: Optional[pd.DataFrame]) -> Figure:
+    """fig (i) from streamed empirical ctx histogram + streamed null ctx histogram."""
+    name = "fig_i_ctx_overlay"
+    if _missing(stat_hist, ("var", "regime", "bin_left", "bin_right", "count"), name):
+        return _placeholder("Empirical vs classical-null CTX", "stat_hist aggregate missing")
+    emp = stat_hist[stat_hist["var"] == "ctx"].groupby(
+        ["bin_left", "bin_right"], as_index=False)["count"].sum().sort_values("bin_left")
+    fig, ax = plt.subplots()
+    if emp["count"].sum() > 0:
+        _hist_step(ax, emp["bin_left"], emp["bin_right"], emp["count"],
+                   OKABE["blue"], "empirical")
+    if null_hist is not None and {"bin_left", "bin_right", "count"} <= set(
+            getattr(null_hist, "columns", [])) and null_hist["count"].sum() > 0:
+        nh = null_hist.sort_values("bin_left")
+        _hist_step(ax, nh["bin_left"], nh["bin_right"], nh["count"],
+                   OKABE["orange"], "classical null")
+    else:
+        log.warning(f"{name}: classical-null histogram unavailable; empirical only.")
+    ax.axvline(0, color=OKABE["black"], ls="--", lw=1.2, label="CTX=0")
+    ax.set_title("CTX: empirical vs classical-null (deflation reproduction)")
+    ax.set_xlabel(r"CTX $=s_{\mathrm{odd}}-\Delta-2$"); ax.set_ylabel("density")
+    ax.legend(loc="upper right")
+    _caption(fig, "Overlap => a purely classical generator reproduces the apparent contextuality.")
+    fig.tight_layout(rect=(0, 0.03, 1, 1))
+    return fig
+
+
+# ==========================================================================
 # (j) threshold robustness sweep: CbD rate vs theta-percentile
 # ==========================================================================
 def plot_threshold_sweep(sweep: pd.DataFrame) -> Figure:
@@ -576,9 +701,67 @@ def load_sector_map(data_dir: str) -> dict:
     return {}
 
 
+def _window_regime_from_shards(shard_dir: str) -> Optional[pd.DataFrame]:
+    """Cheap one-row-per-window crisis/calm table from the partitioned shards
+    (reads only window_id, win_start, regime -- never the full frame)."""
+    try:
+        cols = ["window_id", "win_start", "regime"]
+        g = pd.read_parquet(shard_dir, columns=cols).drop_duplicates("window_id")
+        return g.assign(win_start=pd.to_datetime(g["win_start"])).sort_values("win_start")
+    except Exception as e:                                # noqa: BLE001
+        log.warning(f"window-regime read failed ({e}); crisis shading disabled.")
+        return None
+
+
+def build_all_streaming(data_dir: str, out_dir: str) -> None:
+    """Full-span figure build that consumes the compact aggregates from
+    analyze_streaming (never loads the ~5e7-row pair-window frame)."""
+    set_style()
+    shard_dir = os.path.join(data_dir, "pair_window_stats")
+    headline = _read_optional(os.path.join(data_dir, "headline_rates"))
+    stat_hist = _read_optional(os.path.join(data_dir, "stat_hist"))
+    cell_summary = _read_optional(os.path.join(data_dir, "cell_summary"))
+    scatter = _read_optional(os.path.join(data_dir, "scatter_subsample"))
+    null_hist = _read_optional(os.path.join(data_dir, "classical_null_hist"))
+    elig = _read_optional(os.path.join(data_dir, "window_eligibility"))
+    returns = _read_optional(os.path.join(data_dir, "daily_returns"))
+    sweep = _read_optional(os.path.join(data_dir, "threshold_sweep"))
+    reg_tbl = _window_regime_from_shards(shard_dir)
+
+    figs = {
+        "fig_a_eligible_constituents": lambda: plot_eligible_over_time(
+            elig, reg_tbl if reg_tbl is not None else pd.DataFrame()),
+        "fig_b_coverage_missingness": lambda: plot_coverage_missingness(returns),
+        "fig_c_return_distributions": lambda: plot_return_distributions(returns),
+        "fig_d_cell_counts": lambda: plot_cell_counts_agg(cell_summary),
+        "fig_e_threshold_over_time": lambda: plot_threshold_over_time(returns, elig),
+        "fig_f_statistic_distributions": lambda: plot_statistic_distributions_agg(stat_hist),
+        "fig_g_violation_rates": lambda: plot_violation_rates_agg(headline),
+        "fig_h_sodd_vs_delta": lambda: plot_sodd_vs_delta(scatter),
+        "fig_i_ctx_overlay": lambda: plot_ctx_overlay_agg(stat_hist, null_hist),
+        "fig_j_threshold_sweep": lambda: plot_threshold_sweep(sweep),
+    }
+    for name, fn in figs.items():
+        try:
+            fig = fn()
+            save_figure(fig, out_dir, name)
+            plt.close(fig)
+        except Exception as e:                           # noqa: BLE001
+            log.warning(f"{name}: failed to render ({e}); skipping.")
+    log.info(f"done (streaming) -> {out_dir}")
+
+
 def build_all(data_dir: str, out_dir: str, stats_file: Optional[str] = None,
               null_file: Optional[str] = None) -> None:
-    """Load the parquet inputs and write every figure to `out_dir`."""
+    """Load the parquet inputs and write every figure to `out_dir`.
+
+    Auto-detects the full-span streaming layout: if the analyze_streaming
+    aggregates are present, route to build_all_streaming so the full pair-window
+    frame is never materialized."""
+    if _read_optional(os.path.join(data_dir, "headline_rates")) is not None and \
+       stats_file is None:
+        log.info("detected streaming aggregates -> build_all_streaming")
+        return build_all_streaming(data_dir, out_dir)
     set_style()
     stats = _read_optional(stats_file or os.path.join(data_dir, "pair_window_stats"))
     if stats is None:

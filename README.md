@@ -71,6 +71,16 @@ python src/cbd_analysis.py --reliability      # -> s_odd_reliability.parquet
 # classical-null per-window-dense stats for the networks MR-QAP null baseline:
 python src/cbd_analysis.py --null-gate-stats --gate-windows 6 --gate-nodes 60
 #   -> classical_null_gate_stats.parquet (same schema, source='classical_null').
+
+# FULL 1990-2025 run (memory-safe; the monolithic frame is ~5e7 rows / ~13GB):
+python src/cbd_analysis.py --partition          # streams one shard per window
+#   -> wrds_sp500_data/pair_window_stats/shard_NNNNN.parquet  (partition-by-window)
+#   plus compact aggregates beside it (the per-pair frame is NEVER held in memory):
+#     headline_rates.parquet      per-regime naive(s_odd>2) / CbD(ctx>0) running tallies
+#     stat_hist.parquet           per-(var,regime) histograms of s_odd/delta/ctx
+#     cell_summary.parquet        mean N00..N11 per regime (the N_min health check)
+#     scatter_subsample.parquet   bounded s_odd-vs-delta subsample for fig (h)
+#     classical_null_hist.parquet streamed deflation-null ctx histogram for fig (i)
 ```
 `--crisis-source` auto-detects file type: a `vix` column → window labeled crisis
 when its mean VIX exceeds the sample-median aggregate (override with
@@ -100,7 +110,9 @@ if an input column is missing (logged warning, no crash). The empirical-vs-null
 overlay (fig i) appears once `classical_null_stats.parquet` exists; the
 threshold-sweep figure (fig j) once `threshold_sweep.parquet` exists; the
 sector-stratified exhibit appears if `identifiers.parquet` carries a `sector`
-column.
+column. For the full-span `--partition` run, `plots.py` auto-detects the
+streaming aggregates (`headline_rates.parquet` etc.) and renders figs (d,f,g,h,i)
+from them, so it likewise never materializes the full pair-window frame.
 
 ## Stage 3 — network topology (offline, reads pair_window_stats only)
 ```

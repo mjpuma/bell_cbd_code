@@ -942,6 +942,131 @@ def analyze(data_dir, out_path, n_min, sample=None, crisis_source=None,
     return df
 
 
+# Fixed bin edges for the streamed per-pair distributions (shared with plots.py so
+# the full-span run never materializes the ~5e7-row pair-window frame in memory).
+HIST_EDGES = {
+    "s_odd": np.linspace(0.0, 4.0, 81),
+    "delta": np.linspace(0.0, 2.0, 41),
+    "ctx": np.linspace(-4.0, 2.0, 121),
+}
+
+
+def analyze_streaming(data_dir, out_dir, n_min, *, sample=None, crisis_source=None,
+                      crisis_threshold=None, theta_q=0.5, run_null=True,
+                      null_pairs_per_window=400, scatter_cap=20000, seed=0):
+    """Memory-safe full-span driver. Writes one pair_window_stats SHARD per window
+    (partitioned by window_id) and accumulates only compact running aggregates --
+    never the whole ~5e7-row frame. Aggregates (all gitignored parquet in out_dir):
+
+      headline_rates.parquet  : per-regime n_total/n_valid/n_naive(s_odd>2)/n_cbd(ctx>0)
+      stat_hist.parquet       : per-(var,regime) histogram counts on HIST_EDGES
+      cell_summary.parquet    : per-regime mean of N00..N11 (the N_min health check)
+      scatter_subsample.parquet: bounded reservoir of (s_odd,delta,ctx,regime)
+      classical_null_hist.parquet : streamed null ctx histogram (deflation overlay)
+
+    Downstream (plots.py, networks.py) stream these / the shards window-by-window.
+    """
+    from collections import defaultdict
+    d = load_data(data_dir)
+    elig, ret = d["window_eligibility"], d["daily_returns"]
+    window_ids = sorted(elig.window_id.unique())
+    if sample:
+        window_ids = window_ids[:sample]
+    win_bounds = {wid: (g.win_start.iloc[0], g.win_end.iloc[0])
+                  for wid, g in elig.groupby("window_id")}
+    labels = load_crisis_labels(window_ids, win_bounds, source=crisis_source,
+                                threshold=crisis_threshold)
+    shard_dir = out_dir
+    os.makedirs(shard_dir, exist_ok=True)
+    agg_dir = data_dir                                     # aggregates live beside other outputs
+
+    tally = defaultdict(lambda: np.zeros(4))               # regime -> [total,valid,naive,cbd]
+    hist = defaultdict(lambda: {v: np.zeros(len(e) - 1) for v, e in HIST_EDGES.items()})
+    cell = defaultdict(lambda: [0, np.zeros(4)])           # regime -> [n, sum N00..N11]
+    scatter = []
+    per_win_quota = max(1, scatter_cap // max(1, len(window_ids)))
+    null_hist = np.zeros(len(HIST_EDGES["ctx"]) - 1)
+    null_tally = np.zeros(3)                               # valid, naive, cbd
+
+    n_rows = 0
+    for wid, ws, we, permnos, ret_wide in _iter_window_panels(elig, ret, window_ids, win_bounds):
+        reg = labels.get(wid, "calm")
+        rows = run_window(wid, ws, we, permnos, ret_wide, n_min, theta_q=theta_q)
+        if not rows:
+            continue
+        wdf = pd.DataFrame(rows)
+        wdf["regime"] = reg
+        wdf.to_parquet(os.path.join(shard_dir, f"shard_{int(wid):05d}.parquet"), index=False)
+        n_rows += len(wdf)
+        v = wdf[wdf["valid"]]
+        t = tally[reg]
+        t[0] += len(wdf); t[1] += len(v)
+        t[2] += int((v["s_odd"] > 2).sum()); t[3] += int((v["ctx"] > 0).sum())
+        for var, e in HIST_EDGES.items():
+            hist[reg][var] += np.histogram(v[var].dropna().to_numpy(), bins=e)[0]
+        cell[reg][0] += len(v)
+        cell[reg][1] += v[["N00", "N01", "N10", "N11"]].to_numpy().sum(axis=0)
+        # bounded scatter subsample: an even per-window quota (fast, vectorized)
+        if len(v):
+            take = v if len(v) <= per_win_quota else v.sample(per_win_quota, random_state=seed)
+            scatter.append(take[["s_odd", "delta", "ctx", "regime"]])
+        # streamed deflation null on a per-window sample
+        if run_null and len(v):
+            samp = v if len(v) <= null_pairs_per_window else v.sample(null_pairs_per_window,
+                                                                      random_state=seed)
+            nd = classical_null_reproduction(samp, ret, n_min=n_min, max_pairs=None,
+                                             seed=seed, theta_q=theta_q)
+            if len(nd):
+                nv = nd[nd["valid"]]
+                null_tally += [len(nv), int((nv.s_odd > 2).sum()), int((nv.ctx > 0).sum())]
+                null_hist += np.histogram(nv["ctx"].dropna().to_numpy(),
+                                          bins=HIST_EDGES["ctx"])[0]
+        log.info(f"  window {wid} ({reg}): {len(wdf):,} pairs, {len(v):,} valid "
+                 f"[running total {n_rows:,} rows]")
+
+    # ---- write compact aggregates -------------------------------------------
+    hr = pd.DataFrame([{"regime": r, "n_total": int(t[0]), "n_valid": int(t[1]),
+                        "n_naive": int(t[2]), "n_cbd": int(t[3]),
+                        "naive_rate": (t[2] / t[1]) if t[1] else np.nan,
+                        "cbd_rate": (t[3] / t[1]) if t[1] else np.nan}
+                       for r, t in sorted(tally.items())])
+    _stream_save(hr, os.path.join(agg_dir, "headline_rates.parquet"))
+    hrows = [{"var": var, "regime": r, "bin_left": HIST_EDGES[var][i],
+              "bin_right": HIST_EDGES[var][i + 1], "count": int(c)}
+             for r, hv in hist.items() for var, arr in hv.items()
+             for i, c in enumerate(arr)]
+    _stream_save(pd.DataFrame(hrows), os.path.join(agg_dir, "stat_hist.parquet"))
+    crows = [{"regime": r, "n_valid": int(n),
+              "N00": s[0] / n if n else np.nan, "N01": s[1] / n if n else np.nan,
+              "N10": s[2] / n if n else np.nan, "N11": s[3] / n if n else np.nan}
+             for r, (n, s) in cell.items()]
+    _stream_save(pd.DataFrame(crows), os.path.join(agg_dir, "cell_summary.parquet"))
+    scatter_df = pd.concat(scatter, ignore_index=True) if scatter else pd.DataFrame(
+        columns=["s_odd", "delta", "ctx", "regime"])
+    _stream_save(scatter_df, os.path.join(agg_dir, "scatter_subsample.parquet"))
+    nh = pd.DataFrame([{"bin_left": HIST_EDGES["ctx"][i], "bin_right": HIST_EDGES["ctx"][i + 1],
+                        "count": int(c)} for i, c in enumerate(null_hist)])
+    _stream_save(nh, os.path.join(agg_dir, "classical_null_hist.parquet"))
+
+    log.info(f"STREAMING DONE: {n_rows:,} pair-window rows across {len(window_ids)} "
+             f"windows -> shards in {shard_dir}")
+    for _, r in hr.iterrows():
+        log.info(f"  {r['regime']:>6}: naive(s_odd>2)={r['naive_rate']:.2%}, "
+                 f"CbD(ctx>0)={r['cbd_rate']:.2%}, N_valid={r['n_valid']:,}")
+    if null_tally[0]:
+        log.info(f"  classical-null (streamed): naive={null_tally[1]/null_tally[0]:.2%}, "
+                 f"CbD={null_tally[2]/null_tally[0]:.2%}, N={int(null_tally[0]):,}")
+    return hr
+
+
+def _stream_save(df, path):
+    try:
+        df.to_parquet(path, index=False)
+    except Exception:                                      # noqa: BLE001
+        path = path.replace(".parquet", ".csv"); df.to_csv(path, index=False)
+    log.info(f"  wrote {os.path.basename(path)} ({len(df):,} rows)")
+
+
 # ==========================================================================
 # STEP 2 -- PERCENTILE-THRESHOLD ROBUSTNESS SWEEP
 # ==========================================================================
@@ -1557,6 +1682,16 @@ def parse_args():
     ap = argparse.ArgumentParser(description="CbD analysis over extractor parquet outputs.")
     ap.add_argument("--data-dir", default="wrds_sp500_data")
     ap.add_argument("--out", default="wrds_sp500_data/pair_window_stats.parquet")
+    ap.add_argument("--partition", action="store_true",
+                    help="memory-safe full-span mode: write per-window shards + compact "
+                         "aggregates into a DIRECTORY (default wrds_sp500_data/pair_window_stats) "
+                         "instead of one monolithic frame. Use for the full 1990-2025 run.")
+    ap.add_argument("--partition-out", default="wrds_sp500_data/pair_window_stats",
+                    help="output directory for --partition shards + aggregates")
+    ap.add_argument("--null-pairs-per-window", type=int, default=400,
+                    help="per-window cap on the streamed deflation-null sample (--partition)")
+    ap.add_argument("--no-null-stream", action="store_true",
+                    help="disable the streamed deflation null in --partition mode")
     ap.add_argument("--n-min", type=int, default=10, help="minimum count per regime cell")
     ap.add_argument("--sample", type=int, default=None, help="process only first N windows")
     ap.add_argument("--crisis-source", default=None,
@@ -1641,6 +1776,12 @@ if __name__ == "__main__":
         except Exception:                                  # noqa: BLE001
             out = out.replace(".parquet", ".csv"); nd.to_csv(out, index=False)
         log.info(f"wrote {len(nd):,} null-gate rows -> {out}")
+    elif args.partition:
+        analyze_streaming(args.data_dir, args.partition_out, args.n_min,
+                          sample=args.sample, crisis_source=args.crisis_source,
+                          crisis_threshold=args.crisis_threshold,
+                          theta_q=args.theta_quantile, run_null=not args.no_null_stream,
+                          null_pairs_per_window=args.null_pairs_per_window, seed=args.seed)
     else:
         analyze(args.data_dir, args.out, args.n_min,
                 sample=args.sample, crisis_source=args.crisis_source,
