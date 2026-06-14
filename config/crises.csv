@@ -1,0 +1,11 @@
+name,start,end,type,notes
+Gulf War oil shock,1990-08-01,1991-02-28,energy/financial,"Iraq invasion of Kuwait; oil price spike; brief US recession (NBER Jul1990-Mar1991)."
+Asian crisis / LTCM,1997-07-01,1998-12-31,financial,"Asian currency crises then LTCM collapse and Russian default; VIX spike late 1998; no US recession."
+Dot-com bust,2000-03-01,2002-10-31,financial,"Tech equity collapse; NBER recession Mar-Nov 2001."
+Global food price crisis,2007-01-01,2008-08-31,food,"Grain/rice price surge and export bans; food-specific; only partially overlaps the GFC equity-stress window."
+Global Financial Crisis,2007-12-01,2009-06-30,financial,"NBER recession Dec2007-Jun2009; Lehman Sep2008; the canonical VIX/NBER crisis."
+Russian wheat ban / Arab Spring food spike,2010-06-01,2011-12-31,food,"2010 Russian wheat export ban and 2010-11 food-price spike linked to Arab Spring; little US equity stress."
+European sovereign debt,2011-05-01,2012-09-30,financial,"Greek/peripheral euro crisis; VIX spike Aug2011; no US recession."
+Oil / commodity collapse,2014-06-01,2016-02-29,energy/commodity,"Crude oil and broad commodity price collapse; energy-sector stress; no US recession."
+COVID-19,2020-02-01,2020-06-30,mixed/financial,"Pandemic crash; record VIX Mar2020; NBER recession Feb-Apr 2020."
+Russia-Ukraine food-energy,2022-02-01,2022-12-31,food/energy,"Invasion of Ukraine; wheat/energy price shock and inflation; equity drawdown but no NBER recession."
