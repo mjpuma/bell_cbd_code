@@ -489,6 +489,17 @@ def plot_threshold_sweep(sweep: pd.DataFrame) -> Figure:
                 ax.scatter(100 * dr["theta_q"], 100 * dr["cbd_rate_relaxed"],
                            facecolors="none", edgecolors=col, marker="s", s=90, zorder=5,
                            label=f"{reg}: relaxed N_min={rlx} (small-N diag)")
+                if "cbd_rate_null_relaxed" in dr.columns and dr["cbd_rate_null_relaxed"].notna().any():
+                    ax.scatter(100 * dr["theta_q"], 100 * dr["cbd_rate_null_relaxed"],
+                               color=col, marker="x", s=70, zorder=6, linewidths=1.8,
+                               label=f"{reg}: classical-null (relaxed)")
+    # finite-N ctx>0 noise floor (regime-independent) at the relaxed quantiles
+    if "cbd_rate_smallN_floor" in sweep.columns:
+        fl = sweep.dropna(subset=["cbd_rate_smallN_floor"]).drop_duplicates("theta_q")
+        if len(fl):
+            ax.scatter(100 * fl["theta_q"], 100 * fl["cbd_rate_smallN_floor"],
+                       color=OKABE["green"], marker="_", s=260, zorder=7, linewidths=2.2,
+                       label="finite-N ctx>0 floor")
     ax.set_xlabel(r"$\theta$ percentile of $|R|$  (regime 0 = large-move, $|R|\geq\theta$)")
     ax.set_ylabel("CbD-corrected rate, CTX>0 (%)")
     ax.set_ylim(bottom=0)
@@ -499,8 +510,10 @@ def plot_threshold_sweep(sweep: pd.DataFrame) -> Figure:
     h1, l1 = ax.get_legend_handles_labels()
     if h1:
         ax.legend(loc="upper left", fontsize=9)
-    _caption(fig, "Solid = strict-N_min CbD rate; squares = relaxed-N_min small-sample "
-                  "diagnostic (not a result); dotted = valid denominator (well-posedness boundary).")
+    _caption(fig, "Solid = strict-N_min CbD rate; squares = relaxed-N_min diagnostic, "
+                  "compared to x = classical-null and \u2014 = cell-size-matched finite-N "
+                  "floor (same condition); dotted = valid denominator (log) = "
+                  "well-posedness boundary. Strict rate \u2248 0 across the well-posed band.")
     fig.tight_layout(rect=(0, 0.03, 1, 1))
     return fig
 
@@ -639,14 +652,17 @@ def _synthetic_panel():
 def _synthetic_sweep() -> pd.DataFrame:
     """Tiny synthetic threshold_sweep frame for the (j) smoke test."""
     rows = []
-    for q in (0.5, 0.75, 0.90, 0.95):
+    for q in (0.25, 0.40, 0.50, 0.75, 0.90, 0.95):
         diag = q >= 0.90
         for reg, base in (("crisis", 0.0), ("calm", 0.0)):
             rows.append({"theta_q": q, "regime": reg, "n_min": 10, "relaxed_n_min": 3,
                          "n_valid": int(5000 * (1 - q)), "naive_rate": 0.05,
                          "cbd_rate": base, "n_valid_relaxed": int(9000 * (1 - q)),
                          "naive_rate_relaxed": 0.06,
-                         "cbd_rate_relaxed": 0.02 if diag else 0.0,
+                         "cbd_rate_relaxed": 0.017 if diag else 0.0,
+                         "cbd_rate_null_relaxed": 0.016 if diag else np.nan,
+                         "n_valid_null_relaxed": int(2000 * (1 - q)) if diag else 0,
+                         "cbd_rate_smallN_floor": 0.018 if diag else np.nan,
                          "is_relaxed_diag_q": diag})
     return pd.DataFrame(rows)
 

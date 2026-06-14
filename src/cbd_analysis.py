@@ -491,9 +491,13 @@ def _corr_pm1(a, b):
     return float(np.clip(np.corrcoef(a, b)[0, 1], -1.0, 1.0))
 
 
-def fit_pair_generator(retA, retB, n_min=10):
+def fit_pair_generator(retA, retB, n_min=10, theta_q=0.5):
     """Fit the classical generator to one pair-window's aligned daily returns.
     Returns a params dict, or None if there are too few usable days.
+
+    theta_q : per-stock |R| quantile for the large/small regime split, so the
+              null can be fit under the SAME threshold condition as the empirical
+              analysis it is the null for (matters for the high-theta sweep).
 
     Params schema (also accepted directly by `simulate_pair`, e.g. in tests):
       scaleA/scaleB : (mean|R| large-state, mean|R| small-state)
@@ -509,7 +513,7 @@ def fit_pair_generator(retA, retB, n_min=10):
     mA = np.abs(retA[keep]); mB = np.abs(retB[keep])
     if keep.sum() < 4 * n_min:
         return None
-    thA = window_threshold(mA); thB = window_threshold(mB)
+    thA = window_threshold(mA, theta_q); thB = window_threshold(mB, theta_q)
     x = assign_regime(mA, thA); y = assign_regime(mB, thB)   # 0=large, 1=small
 
     def _scale(m, reg):
@@ -529,12 +533,13 @@ def fit_pair_generator(retA, retB, n_min=10):
     return {"scaleA": _scale(mA, x), "scaleB": _scale(mB, y), "cells": cells}
 
 
-def simulate_pair(params, n_days, rng):
+def simulate_pair(params, n_days, rng, theta_q=0.5):
     """Simulate n_days of (retA, retB) from a fitted/explicit generator.
 
     Magnitudes come from a two-state mixture per stock; the *regime* is then the
-    pipeline's median split (so it matches the downstream estimator exactly), and
-    signs are drawn from the per-cell classical joint conditioned on that regime.
+    pipeline's quantile split at `theta_q` (so it matches the downstream estimator
+    exactly, including under the high-theta sweep), and signs are drawn from the
+    per-cell classical joint conditioned on that regime.
     Returns (retA, retB) as signed-magnitude arrays.
     """
     scaleA = params["scaleA"]; scaleB = params["scaleB"]; cells = params["cells"]
@@ -545,8 +550,8 @@ def simulate_pair(params, n_days, rng):
         return rng.exponential(sc)
 
     mA = _mags(scaleA); mB = _mags(scaleB)
-    xs = assign_regime(mA, window_threshold(mA))              # pipeline median split
-    ys = assign_regime(mB, window_threshold(mB))
+    xs = assign_regime(mA, window_threshold(mA, theta_q))     # pipeline quantile split
+    ys = assign_regime(mB, window_threshold(mB, theta_q))
 
     a = np.empty(n_days); b = np.empty(n_days)
     for (cx, cy) in CELLS:
@@ -560,7 +565,8 @@ def simulate_pair(params, n_days, rng):
 
 
 def classical_null_reproduction(pair_window_stats, returns_panel, *,
-                                n_min=10, max_pairs=None, seed=0, valid_only=True):
+                                n_min=10, max_pairs=None, seed=0, valid_only=True,
+                                theta_q=0.5):
     """The deflation null. For each (valid) empirical pair-window: fit the
     purely-classical generator to that pair's real returns, simulate a panel of
     equal length, push it through the SAME estimator, and record the simulated
@@ -598,11 +604,12 @@ def classical_null_reproduction(pair_window_stats, returns_panel, *,
         joined = pd.concat([sa.rename("a"), sb.rename("b")], axis=1)
         if joined.empty:
             continue
-        params = fit_pair_generator(joined["a"].to_numpy(), joined["b"].to_numpy(), n_min)
+        params = fit_pair_generator(joined["a"].to_numpy(), joined["b"].to_numpy(),
+                                    n_min, theta_q=theta_q)
         if params is None:
             continue
-        ra, rb = simulate_pair(params, len(joined), rng)
-        res = _pair_stats_from_returns(ra, rb, n_min)
+        ra, rb = simulate_pair(params, len(joined), rng, theta_q=theta_q)
+        res = _pair_stats_from_returns(ra, rb, n_min, theta_q=theta_q)
         row = _pack_row(r["window_id"], ws, we, pa, pb, res["E"], res["a_marg"],
                         res["b_marg"], res["N"], res["s_odd"], res["delta"],
                         res["ctx"], res["valid"])
@@ -619,14 +626,15 @@ def classical_null_reproduction(pair_window_stats, returns_panel, *,
     return out
 
 
-def _pair_stats_from_returns(retA, retB, n_min):
+def _pair_stats_from_returns(retA, retB, n_min, theta_q=0.5):
     """Push one pair's (retA, retB) through the SAME estimator the driver uses:
-    drop NaN/zero-sign days, per-stock median threshold, regime, compute_pair_window.
+    drop NaN/zero-sign days, per-stock theta_q-quantile threshold, regime,
+    compute_pair_window.
     """
     retA = np.asarray(retA, dtype=float); retB = np.asarray(retB, dtype=float)
     nanA = np.isnan(retA); nanB = np.isnan(retB)
-    thA = window_threshold(np.abs(retA[~nanA])) if (~nanA).any() else np.nan
-    thB = window_threshold(np.abs(retB[~nanB])) if (~nanB).any() else np.nan
+    thA = window_threshold(np.abs(retA[~nanA]), theta_q) if (~nanA).any() else np.nan
+    thB = window_threshold(np.abs(retB[~nanB]), theta_q) if (~nanB).any() else np.nan
     sa = np.sign(retA); sb = np.sign(retB)
     x = assign_regime(np.abs(retA), thA); y = assign_regime(np.abs(retB), thB)
     keep = (sa != 0) & (sb != 0) & ~nanA & ~nanB
@@ -920,21 +928,32 @@ def analyze(data_dir, out_path, n_min, sample=None, crisis_source=None,
 # ==========================================================================
 # STEP 2 -- PERCENTILE-THRESHOLD ROBUSTNESS SWEEP
 # ==========================================================================
-def sweep_thresholds(data_dir, quantiles=(0.5, 0.75, 0.90, 0.95), n_min=10,
-                     crisis_source=None, crisis_threshold=None, sample=None,
-                     relaxed_n_min=3, relaxed_quantiles=(0.90, 0.95)):
+def sweep_thresholds(data_dir, quantiles=(0.25, 0.40, 0.50, 0.75, 0.90, 0.95),
+                     n_min=10, crisis_source=None, crisis_threshold=None, sample=None,
+                     relaxed_n_min=3, relaxed_quantiles=(0.90, 0.95),
+                     null_relative=True, null_cap=3000, seed=0):
     """Sweep the magnitude-context threshold theta over `quantiles` and report the
     deflation (naive s_odd>2 vs CbD ctx>0) by regime at each theta. Tallies are
     accumulated per-window (never materializing all pair-windows), so this scales.
 
-    Strict headline: N_min held at `n_min` (= the spec's 10). A SMALL-SAMPLE
-    DIAGNOSTIC at the high quantiles relaxes N_min to `relaxed_n_min` purely to
-    show that any ctx>0 surfacing there is finite-N noise, not hidden contextuality
-    -- it is a diagnostic, not a result. At high theta the large-move regime gets
-    rare, so the four-cell CHSH structure loses support and the valid denominator
-    collapses: that is the method's well-posedness boundary, reported as such.
+    TWO ROLES of the sweep points (do not conflate):
+      * sub-median {0.25, 0.40, 0.50}: the both-large (E00) cell stays populated,
+        so these test the ROBUSTNESS OF THE DEFLATION (the headline claim that the
+        CbD-corrected rate ~ 0 should hold across them).
+      * {0.75, 0.90, 0.95}: the large-move regime gets rare, the four-cell CHSH
+        structure loses support and the strict valid denominator collapses -- these
+        DOCUMENT THE WELL-POSEDNESS BOUNDARY, not a failure of deflation.
+    theta=0.50 remains the canonical split for the E00 fragility network elsewhere
+    (networks.py); this sweep is a separate robustness exhibit.
 
-    Returns one row per (theta_q, regime) with strict + relaxed rates and counts.
+    Strict headline holds N_min at `n_min` (= the spec's 10). A SMALL-SAMPLE
+    DIAGNOSTIC at the high (relaxed_) quantiles relaxes N_min to `relaxed_n_min`;
+    when `null_relative`, the classical null is ALSO run under the SAME
+    relaxed-N_min/high-theta condition so the diagnostic is null-relative: if the
+    empirical relaxed ctx>0 ~ the null ctx>0, the residual rate is finite-sample
+    noise, not contextuality. If empirical materially exceeds null, it is flagged.
+
+    Returns one row per (theta_q, regime) with strict + relaxed (+ null) rates.
     """
     from collections import defaultdict
     d = load_data(data_dir)
@@ -947,17 +966,22 @@ def sweep_thresholds(data_dir, quantiles=(0.5, 0.75, 0.90, 0.95), n_min=10,
     labels = load_crisis_labels(window_ids, win_bounds, source=crisis_source,
                                 threshold=crisis_threshold)
     base_nmin = min(n_min, relaxed_n_min)
+    relaxed_set = {float(q) for q in relaxed_quantiles}
     # tally[(q, regime)] = [strict_valid, strict_naive, strict_cbd,
     #                       relaxed_valid, relaxed_naive, relaxed_cbd]
     tally = defaultdict(lambda: np.zeros(6))
+    # reservoir of relaxed-valid pairs at the relaxed quantiles, for the null pass
+    null_samples = defaultdict(list)                      # (q, regime) -> list[rowdict]
+    rng = np.random.default_rng(seed)
     log.info(f"threshold sweep over quantiles {tuple(quantiles)} "
              f"(strict N_min={n_min}; relaxed diagnostic N_min={relaxed_n_min} "
-             f"at q in {tuple(relaxed_quantiles)})")
+             f"at q in {tuple(relaxed_quantiles)}; null_relative={null_relative})")
     for wid, ws, we, permnos, ret_wide in _iter_window_panels(elig, ret, window_ids, win_bounds):
         reg = labels.get(wid, "calm")
         for q in quantiles:
             rows = run_window(wid, ws, we, permnos, ret_wide, base_nmin, theta_q=q)
             t = tally[(float(q), reg)]
+            is_relaxed_q = float(q) in relaxed_set
             for r in rows:
                 nmin = min(r["N00"], r["N01"], r["N10"], r["N11"])
                 if nmin < relaxed_n_min or np.isnan(r["s_odd"]):
@@ -965,11 +989,43 @@ def sweep_thresholds(data_dir, quantiles=(0.5, 0.75, 0.90, 0.95), n_min=10,
                 t[3] += 1; t[4] += (r["s_odd"] > 2); t[5] += (r["ctx"] > 0)
                 if nmin >= n_min:
                     t[0] += 1; t[1] += (r["s_odd"] > 2); t[2] += (r["ctx"] > 0)
+                if null_relative and is_relaxed_q:        # reservoir-sample for null
+                    bucket = null_samples[(float(q), reg)]
+                    rec = {"window_id": wid, "win_start": ws, "win_end": we,
+                           "permno_a": r["permno_a"], "permno_b": r["permno_b"],
+                           "regime": reg, "valid": True,
+                           "N00": r["N00"], "N01": r["N01"],
+                           "N10": r["N10"], "N11": r["N11"]}
+                    if len(bucket) < null_cap:
+                        bucket.append(rec)
+                    else:
+                        j = rng.integers(0, t[3])
+                        if j < null_cap:
+                            bucket[int(j)] = rec
         log.info(f"  swept window {wid} ({reg})")
+
+    null_rate = _sweep_null_rates(null_samples, ret, relaxed_n_min, seed) \
+        if null_relative else {}
+    # cell-size-MATCHED finite-N ctx>0 floor: simulate iid signs at each empirical
+    # relaxed-valid pair's actual (N00,N01,N10,N11) geometry (the proper noise floor;
+    # the equal-cell floor understates it because only the binding cell is small).
+    matched_floor = {}
+    if null_relative:
+        eqfloor = _finite_n_ctx_floor(relaxed_n_min, seed=seed)
+        log.info(f"finite-N ctx>0 floor (equal cells at N={relaxed_n_min}): {eqfloor:.2%}")
+        for (q, reg), recs in null_samples.items():
+            tuples = [(int(r["N00"]), int(r["N01"]), int(r["N10"]), int(r["N11"]))
+                      for r in recs]
+            matched_floor[(q, reg)] = _matched_finite_n_floor(tuples, seed=seed)
+            log.info(f"  matched finite-N floor @ theta_q={q:.2f} {reg}: "
+                     f"{matched_floor[(q, reg)]:.2%} (from {len(tuples):,} cell geometries)")
 
     out = []
     for (q, reg), t in sorted(tally.items()):
         sv, rv = t[0], t[3]
+        nr = null_rate.get((q, reg), {})
+        is_relaxed_q = float(q) in relaxed_set
+        floor_qr = matched_floor.get((q, reg), np.nan) if is_relaxed_q else np.nan
         out.append({
             "theta_q": q, "regime": reg, "n_min": n_min, "relaxed_n_min": relaxed_n_min,
             "n_valid": int(sv),
@@ -978,19 +1034,195 @@ def sweep_thresholds(data_dir, quantiles=(0.5, 0.75, 0.90, 0.95), n_min=10,
             "n_valid_relaxed": int(rv),
             "naive_rate_relaxed": (t[4] / rv) if rv else np.nan,
             "cbd_rate_relaxed": (t[5] / rv) if rv else np.nan,
-            "is_relaxed_diag_q": bool(any(np.isclose(q, rq) for rq in relaxed_quantiles)),
+            "cbd_rate_null_relaxed": nr.get("cbd_rate", np.nan),
+            "n_valid_null_relaxed": nr.get("n_valid", 0),
+            "cbd_rate_smallN_floor": floor_qr,
+            "is_relaxed_diag_q": is_relaxed_q,
         })
     df = pd.DataFrame(out)
     for _, r in df.iterrows():
-        log.info(f"  theta_q={r.theta_q:.2f} {r.regime:>6}: "
-                 f"naive(s_odd>2)={r.naive_rate:.2%}, CbD(ctx>0)={r.cbd_rate:.2%}, "
-                 f"N_valid={r.n_valid:,}"
-                 + (f"  [relaxed N_min={relaxed_n_min}: CbD={r.cbd_rate_relaxed:.2%}, "
-                    f"N={r.n_valid_relaxed:,}]" if r.is_relaxed_diag_q else ""))
+        msg = (f"  theta_q={r.theta_q:.2f} {r.regime:>6}: "
+               f"naive(s_odd>2)={r.naive_rate:.2%}, CbD(ctx>0)={r.cbd_rate:.2%}, "
+               f"N_valid={r.n_valid:,}")
+        if r.is_relaxed_diag_q:
+            msg += (f"  [relaxed N_min={relaxed_n_min}: CbD={r.cbd_rate_relaxed:.2%} "
+                    f"(N={r.n_valid_relaxed:,}); classical-null={r.cbd_rate_null_relaxed:.2%} "
+                    f"(N={r.n_valid_null_relaxed:,}); finite-N floor={r.cbd_rate_smallN_floor:.2%}]")
+        log.info(msg)
         if r.cbd_rate > 0.01:
-            log.warning(f"  !! theta_q={r.theta_q:.2f} {r.regime}: CbD rate "
+            log.warning(f"  !! theta_q={r.theta_q:.2f} {r.regime}: strict CbD rate "
                         f"{r.cbd_rate:.2%} > 1% -- INSPECT (a result, not a bug).")
+        # only a genuine concern if empirical clears BOTH the (possibly-collapsed)
+        # classical null AND the finite-N noise floor
+        if (r.is_relaxed_diag_q and np.isfinite(r.cbd_rate_smallN_floor)
+                and r.cbd_rate_relaxed > r.cbd_rate_smallN_floor + 0.01
+                and (not np.isfinite(r.cbd_rate_null_relaxed)
+                     or r.n_valid_null_relaxed < 100
+                     or r.cbd_rate_relaxed > r.cbd_rate_null_relaxed + 0.01)):
+            log.warning(f"  !! theta_q={r.theta_q:.2f} {r.regime}: empirical relaxed CbD "
+                        f"{r.cbd_rate_relaxed:.2%} exceeds the finite-N floor "
+                        f"{r.cbd_rate_smallN_floor:.2%} -- NOT just small-N noise; INSPECT.")
     return df
+
+
+def s_odd_split_half_reliability(elig, ret, *, n_min=10, theta_q=0.5, sample=None,
+                                 seed=0, half_n_min=None):
+    """Per-window s_odd RELIABILITY ceiling (supports the MR-QAP gate framing).
+
+    Split each window's trading days into two interleaved halves (even/odd days,
+    so both halves see the same regime mix), recompute s_odd per pair on each half
+    with the SAME estimator, and correlate the two edge-weight vectors over pairs
+    valid in both halves. The half-split Pearson r is corrected to a full-length
+    estimate by Spearman-Brown (r_sb = 2r/(1+r)). This is the ceiling against which
+    any 's_odd structure beyond tail coupling' must be judged: a network can only
+    encode structure up to the reliability of its edge weights.
+
+    Each half has ~half the days, which cannot support the full N_min across four
+    cells, so the halves use a relaxed `half_n_min` (default max(3, n_min//2)); the
+    resulting r is a (conservative) reliability estimate at reduced N. Computed here
+    (not in networks.py) because it needs the per-DAY series only the driver has.
+    Returns one row per window.
+    """
+    half_n_min = half_n_min if half_n_min is not None else max(3, n_min // 2)
+    window_ids = sorted(elig.window_id.unique())
+    if sample:
+        window_ids = window_ids[:sample]
+    win_bounds = {wid: (g.win_start.iloc[0], g.win_end.iloc[0])
+                  for wid, g in elig.groupby("window_id")}
+    rows = []
+    for wid, ws, we, permnos, ret_wide in _iter_window_panels(elig, ret, window_ids, win_bounds):
+        rw = ret_wide.sort_index()
+        ha, hb = rw.iloc[0::2], rw.iloc[1::2]              # interleaved halves
+        if len(ha) < 4 * half_n_min or len(hb) < 4 * half_n_min:
+            continue
+        sa = {(r["permno_a"], r["permno_b"]): r["s_odd"]
+              for r in run_window(wid, ws, we, permnos, ha, half_n_min, theta_q=theta_q)
+              if r["valid"] and not np.isnan(r["s_odd"])}
+        sb = {(r["permno_a"], r["permno_b"]): r["s_odd"]
+              for r in run_window(wid, ws, we, permnos, hb, half_n_min, theta_q=theta_q)
+              if r["valid"] and not np.isnan(r["s_odd"])}
+        common = set(sa) & set(sb)
+        if len(common) < 3:
+            continue
+        va = np.array([sa[k] for k in common]); vb = np.array([sb[k] for k in common])
+        if va.std() == 0 or vb.std() == 0:
+            continue
+        r = float(np.corrcoef(va, vb)[0, 1])
+        r_sb = (2 * r / (1 + r)) if (1 + r) != 0 else np.nan
+        rows.append({"window_id": wid, "win_start": ws, "n_pairs": len(common),
+                     "reliability_halfsplit": r, "reliability_sb": r_sb})
+        log.info(f"  reliability window {wid}: r={r:.3f} (SB={r_sb:.3f}), "
+                 f"N_common={len(common):,}")
+    df = pd.DataFrame(rows)
+    if len(df):
+        log.info(f"s_odd reliability: mean half-split r={df.reliability_halfsplit.mean():.3f}, "
+                 f"mean Spearman-Brown r={df.reliability_sb.mean():.3f}")
+    return df
+
+
+def _resolve_stats_path(stats_path):
+    """Return a readable parquet path/dir for pair_window_stats (handles bare name)."""
+    for cand in (stats_path, stats_path + ".parquet"):
+        if os.path.isdir(cand) or os.path.exists(cand):
+            return cand
+    return stats_path
+
+
+def emit_null_gate_stats(stats_path, returns, *, n_windows=6, n_nodes=60,
+                         theta_q=0.5, n_min=10, seed=0):
+    """Emit a per-window-DENSE classical-null pair_window_stats frame for the
+    networks MR-QAP null baseline. For the first `n_windows` windows it takes the
+    first `n_nodes` names (sorted) appearing in valid real pairs and simulates the
+    classical null for ALL real valid pairs among them (same window x node support
+    the gate uses, so real-vs-null R^2 is apples-to-apples). Schema is identical to
+    pair_window_stats (tagged source='classical_null'); the null's math is unchanged.
+    Output is meant to be gitignored.
+    """
+    path = _resolve_stats_path(stats_path)
+    ids = sorted(pd.read_parquet(path, columns=["window_id"])["window_id"].unique())[:n_windows]
+    cols = ["window_id", "win_start", "win_end", "permno_a", "permno_b", "valid", "regime"]
+    df = pd.read_parquet(path, columns=cols, filters=[("window_id", "in", ids)])
+    out = []
+    for wid, g in df.groupby("window_id"):
+        gv = g[g["valid"]] if "valid" in g.columns else g
+        nodes = sorted(pd.unique(gv[["permno_a", "permno_b"]].to_numpy().ravel()).tolist())
+        keep = set(nodes[:n_nodes])
+        sub = gv[gv["permno_a"].isin(keep) & gv["permno_b"].isin(keep)]
+        if sub.empty:
+            continue
+        nd = classical_null_reproduction(sub, returns, n_min=n_min, max_pairs=None,
+                                         seed=seed, theta_q=theta_q)
+        if len(nd):
+            out.append(nd)
+        log.info(f"  null-gate window {wid}: {len(keep)} nodes, "
+                 f"{len(sub):,} pairs -> {len(nd) if len(nd) else 0:,} null rows")
+    return pd.concat(out, ignore_index=True) if out else pd.DataFrame()
+
+
+def _finite_n_ctx_floor(n_min, *, n_sims=8000, seed=0):
+    """Finite-N ctx>0 false-positive floor: push iid fair +-1 signs through the FULL
+    estimator (correlations AND marginals, so delta is included) at equal per-cell
+    count `n_min`, and return the fraction with ctx>0. This is the proper noise
+    baseline for the relaxed-N_min diagnostic: equal cells at the binding N_min are
+    the worst case, so empirical <= this floor => the rate is finite-sample noise,
+    not contextuality. (Complements the per-pair classical null, which cannot
+    populate the four cells at high theta and collapses there.)"""
+    rng = np.random.default_rng(seed)
+    cnt = 0
+    for _ in range(int(n_sims)):
+        E = np.empty(4); am = np.empty(4); bm = np.empty(4)
+        for k in range(4):
+            a = rng.choice([-1.0, 1.0], n_min); b = rng.choice([-1.0, 1.0], n_min)
+            E[k] = np.mean(a * b); am[k] = np.mean(a); bm[k] = np.mean(b)
+        if ctx(E, am, bm) > 0:
+            cnt += 1
+    return cnt / n_sims
+
+
+def _matched_finite_n_floor(cellsizes, *, seed=0, max_tuples=5000):
+    """Cell-size-MATCHED finite-N ctx>0 floor. For each empirical relaxed-valid
+    pair's actual (N00,N01,N10,N11), draw iid fair +-1 signs at exactly those cell
+    sizes and push through the full estimator; return the fraction with ctx>0. This
+    is the correctly-matched noise baseline (it reproduces the realistic geometry --
+    typically one tiny binding cell and three large cells -- which the equal-cell
+    floor does not). empirical ~ this floor => finite-sample noise."""
+    if not cellsizes:
+        return np.nan
+    rng = np.random.default_rng(seed)
+    if len(cellsizes) > max_tuples:
+        idx = rng.choice(len(cellsizes), max_tuples, replace=False)
+        cellsizes = [cellsizes[i] for i in idx]
+    cnt = 0
+    for sizes in cellsizes:
+        E = np.empty(4); am = np.empty(4); bm = np.empty(4)
+        for k, N in enumerate(sizes):
+            N = max(int(N), 1)
+            a = rng.choice([-1.0, 1.0], N); b = rng.choice([-1.0, 1.0], N)
+            E[k] = np.mean(a * b); am[k] = np.mean(a); bm[k] = np.mean(b)
+        if ctx(E, am, bm) > 0:
+            cnt += 1
+    return cnt / len(cellsizes)
+
+
+def _sweep_null_rates(null_samples, ret, relaxed_n_min, seed):
+    """Run the classical null on the reservoir-sampled relaxed-valid pairs at each
+    relaxed (q, regime), under the SAME relaxed N_min and that theta_q. Returns
+    {(q, regime): {'cbd_rate':.., 'n_valid':..}} so the sweep diagnostic is
+    null-relative (empirical ~ null => finite-sample noise)."""
+    out = {}
+    for (q, reg), recs in null_samples.items():
+        if not recs:
+            continue
+        sub = pd.DataFrame(recs)
+        nd = classical_null_reproduction(sub, ret, n_min=relaxed_n_min, max_pairs=None,
+                                         seed=seed, theta_q=float(q))
+        if len(nd):
+            v = nd[nd["valid"]]
+            out[(q, reg)] = {"cbd_rate": float((v.ctx > 0).mean()) if len(v) else np.nan,
+                             "n_valid": int(len(v))}
+            log.info(f"  null @ theta_q={q:.2f} {reg}: CbD(ctx>0)="
+                     f"{out[(q, reg)]['cbd_rate']:.2%} (N={out[(q, reg)]['n_valid']:,})")
+    return out
 
 
 # ==========================================================================
@@ -1055,8 +1287,8 @@ def _test_threshold_sweep():
     """sweep_thresholds returns the expected schema and strict<=relaxed valid counts."""
     import tempfile
     rng = np.random.default_rng(5)
-    dates = pd.bdate_range("2008-01-02", periods=80)
-    permnos = [11, 22, 33, 44]
+    dates = pd.bdate_range("2008-01-02", periods=200)
+    permnos = [11, 22, 33, 44, 55, 66]
     recs = [(p, d, float(rng.normal(0, 0.02))) for p in permnos for d in dates]
     ret = pd.DataFrame(recs, columns=["permno", "date", "ret"])
     memb = pd.DataFrame({"permno": permnos, "mbrstartdt": pd.Timestamp("2000-01-01"),
@@ -1068,12 +1300,55 @@ def _test_threshold_sweep():
         for nm, df in (("membership", memb), ("daily_returns", ret),
                        ("trading_calendar", cal), ("window_eligibility", elig)):
             df.to_parquet(os.path.join(tmp, nm + ".parquet"), index=False)
-        sw = sweep_thresholds(tmp, quantiles=(0.5, 0.9), n_min=5, relaxed_n_min=2,
-                              relaxed_quantiles=(0.9,))
+        sw = sweep_thresholds(tmp, quantiles=(0.5, 0.75), n_min=5, relaxed_n_min=2,
+                              relaxed_quantiles=(0.75,), null_relative=True)
     assert {"theta_q", "regime", "cbd_rate", "n_valid", "cbd_rate_relaxed",
-            "n_valid_relaxed", "is_relaxed_diag_q"} <= set(sw.columns)
+            "n_valid_relaxed", "cbd_rate_null_relaxed", "n_valid_null_relaxed",
+            "is_relaxed_diag_q"} <= set(sw.columns)
     assert (sw["n_valid_relaxed"] >= sw["n_valid"]).all()
     assert sw["is_relaxed_diag_q"].any()
+    # the null-relative diagnostic ran at the relaxed quantile (some null pairs valid)
+    diag = sw[sw["is_relaxed_diag_q"]]
+    assert (diag["n_valid_null_relaxed"] > 0).any()
+
+
+def _test_null_theta_threading():
+    """The classical null honors theta_q: a higher quantile shrinks the large-move
+    regime so the four-cell structure has fewer large-cell days (smaller N00)."""
+    rng = np.random.default_rng(11)
+    params = {"scaleA": (3.0, 1.0), "scaleB": (3.0, 1.0),
+              "cells": {(0, 0): (0.5, 0.5, 0.5), (0, 1): (0.5, 0.5, 0.5),
+                        (1, 0): (0.5, 0.5, 0.5), (1, 1): (0.5, 0.5, -0.5)}}
+    ra, rb = simulate_pair(params, 6000, rng, theta_q=0.9)
+    lo = _pair_stats_from_returns(ra, rb, n_min=1, theta_q=0.5)
+    hi = _pair_stats_from_returns(ra, rb, n_min=1, theta_q=0.9)
+    assert hi["N"][0] < lo["N"][0], (hi["N"][0], lo["N"][0])   # N00 shrinks with theta
+
+
+def _test_reliability_and_null_gate():
+    """s_odd_split_half_reliability returns r in [-1,1] per window, and
+    emit_null_gate_stats produces a same-schema null frame for the gate."""
+    import tempfile
+    rng = np.random.default_rng(13)
+    dates = pd.bdate_range("2008-01-02", periods=120)
+    permnos = list(range(8))
+    recs = [(p, d, float(rng.normal(0, 0.02))) for p in permnos for d in dates]
+    ret = pd.DataFrame(recs, columns=["permno", "date", "ret"])
+    elig = pd.DataFrame([(0, dates[0], dates[-1], p) for p in permnos],
+                        columns=["window_id", "win_start", "win_end", "permno"])
+    rel = s_odd_split_half_reliability(elig, ret, n_min=3, theta_q=0.5)
+    assert {"window_id", "reliability_halfsplit", "reliability_sb"} <= set(rel.columns)
+    if len(rel):
+        assert rel["reliability_halfsplit"].between(-1, 1).all()
+    # build a tiny pair_window_stats and emit the null-gate frame
+    rw = ret.pivot_table(index="date", columns="permno", values="ret")
+    stats = pd.DataFrame(run_window(0, dates[0], dates[-1], permnos, rw, n_min=3))
+    stats["regime"] = "calm"
+    with tempfile.TemporaryDirectory() as tmp:
+        sp = os.path.join(tmp, "pair_window_stats.parquet")
+        stats.to_parquet(sp, index=False)
+        nd = emit_null_gate_stats(sp, ret, n_windows=1, n_nodes=6, n_min=3)
+    assert {"window_id", "permno_a", "permno_b", "s_odd", "ctx", "valid"} <= set(nd.columns)
 
 
 def _close_nan(x, y, atol=1e-9):
@@ -1234,7 +1509,8 @@ def _test_controls():
 
 
 _TESTS = (_test_handchecked, _test_postselection, _test_anchors, _test_pipeline_smoke,
-          _test_theta_quantile, _test_threshold_sweep,
+          _test_theta_quantile, _test_threshold_sweep, _test_null_theta_threading,
+          _test_reliability_and_null_gate,
           _test_vectorized_equivalence, _test_crisis_labels, _test_crisis_taxonomy,
           _test_classical_generator_reproduces_box, _test_classical_null_runs,
           _test_exogenous_contrast, _test_controls)
@@ -1264,15 +1540,31 @@ def parse_args():
                     help="cap on simulated pairs for the null (distribution, not all pairs)")
     ap.add_argument("--theta-quantile", type=float, default=0.5,
                     help="per-stock |R| quantile for the large/small regime split (spec default 0.5)")
-    ap.add_argument("--sweep", default=None,
-                    help="run the theta robustness sweep over a comma list of quantiles "
-                         "(e.g. '0.5,0.75,0.9,0.95') -> writes threshold_sweep.parquet and exits")
+    ap.add_argument("--sweep", nargs="?", const="default", default=None,
+                    help="run the theta robustness sweep -> threshold_sweep.parquet and "
+                         "exit. Bare --sweep uses {0.25,0.40,0.50,0.75,0.90,0.95}; or pass "
+                         "a comma list e.g. --sweep '0.25,0.5,0.9'")
     ap.add_argument("--sweep-out", default=None, help="path for the threshold-sweep parquet")
     ap.add_argument("--relaxed-n-min", type=int, default=3,
                     help="small-sample diagnostic N_min at high-theta sweep points")
+    ap.add_argument("--no-sweep-null", action="store_true",
+                    help="disable the null-relative diagnostic in the sweep")
+    ap.add_argument("--reliability", action="store_true",
+                    help="compute s_odd split-half reliability -> s_odd_reliability.parquet and exit")
+    ap.add_argument("--null-gate-stats", action="store_true",
+                    help="emit a per-window-dense classical-null pair_window_stats frame "
+                         "(for the networks MR-QAP null baseline) -> "
+                         "classical_null_gate_stats.parquet and exit")
+    ap.add_argument("--gate-windows", type=int, default=6,
+                    help="windows for --null-gate-stats / reliability emission (cost control)")
+    ap.add_argument("--gate-nodes", type=int, default=60,
+                    help="first-N nodes per window for the null-gate emission (cost control)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--test", action="store_true", help="run unit tests and exit")
     return ap.parse_args()
+
+
+_DEFAULT_SWEEP = (0.25, 0.40, 0.50, 0.75, 0.90, 0.95)
 
 
 if __name__ == "__main__":
@@ -1280,18 +1572,44 @@ if __name__ == "__main__":
     if args.test:
         run_tests()
     elif args.sweep:
-        quantiles = tuple(float(q) for q in args.sweep.split(","))
+        quantiles = (_DEFAULT_SWEEP if args.sweep == "default"
+                     else tuple(float(q) for q in args.sweep.split(",")))
         relaxed = tuple(q for q in quantiles if q >= 0.90)
         sw = sweep_thresholds(args.data_dir, quantiles=quantiles, n_min=args.n_min,
                               crisis_source=args.crisis_source,
                               crisis_threshold=args.crisis_threshold, sample=args.sample,
-                              relaxed_n_min=args.relaxed_n_min, relaxed_quantiles=relaxed)
+                              relaxed_n_min=args.relaxed_n_min, relaxed_quantiles=relaxed,
+                              null_relative=not args.no_sweep_null, seed=args.seed)
         sweep_out = args.sweep_out or os.path.join(args.data_dir, "threshold_sweep.parquet")
         try:
             sw.to_parquet(sweep_out, index=False)
         except Exception:                                  # noqa: BLE001
             sweep_out = sweep_out.replace(".parquet", ".csv"); sw.to_csv(sweep_out, index=False)
         log.info(f"wrote threshold sweep -> {sweep_out}")
+    elif args.reliability:
+        d = load_data(args.data_dir)
+        rel = s_odd_split_half_reliability(
+            d["window_eligibility"], d["daily_returns"], n_min=args.n_min,
+            theta_q=args.theta_quantile, sample=args.sample, seed=args.seed)
+        out = os.path.join(args.data_dir, "s_odd_reliability.parquet")
+        try:
+            rel.to_parquet(out, index=False)
+        except Exception:                                  # noqa: BLE001
+            out = out.replace(".parquet", ".csv"); rel.to_csv(out, index=False)
+        log.info(f"wrote s_odd reliability -> {out}")
+    elif args.null_gate_stats:
+        d = load_data(args.data_dir)
+        stats_path = os.path.join(args.data_dir, "pair_window_stats")
+        nd = emit_null_gate_stats(stats_path, d["daily_returns"],
+                                  n_windows=args.gate_windows, n_nodes=args.gate_nodes,
+                                  theta_q=args.theta_quantile, n_min=args.n_min,
+                                  seed=args.seed)
+        out = os.path.join(args.data_dir, "classical_null_gate_stats.parquet")
+        try:
+            nd.to_parquet(out, index=False)
+        except Exception:                                  # noqa: BLE001
+            out = out.replace(".parquet", ".csv"); nd.to_csv(out, index=False)
+        log.info(f"wrote {len(nd):,} null-gate rows -> {out}")
     else:
         analyze(args.data_dir, args.out, args.n_min,
                 sample=args.sample, crisis_source=args.crisis_source,

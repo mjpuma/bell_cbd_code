@@ -58,9 +58,18 @@ python src/cbd_analysis.py --crisis-source path/to/recessions.csv  # columns: st
 python src/cbd_analysis.py --null --null-max-pairs 5000
 
 # magnitude-threshold robustness sweep (theta = per-stock |R| quantile):
-python src/cbd_analysis.py --sweep "0.5,0.75,0.9,0.95" --crisis-source nber
-#   -> wrds_sp500_data/threshold_sweep.parquet (strict N_min headline + a
-#      relaxed-N_min small-sample DIAGNOSTIC at the high quantiles).
+python src/cbd_analysis.py --sweep --crisis-source nber   # bare --sweep = default set
+#   default {0.25,0.40,0.50,0.75,0.90,0.95}; or pass --sweep "0.25,0.5,0.9".
+#   -> wrds_sp500_data/threshold_sweep.parquet (strict N_min headline; relaxed-N_min
+#      DIAGNOSTIC at high quantiles, reported NULL-RELATIVE: classical-null ctx>0 and
+#      a cell-size-matched finite-N ctx>0 floor next to the empirical relaxed rate).
+
+# s_odd split-half reliability (the MR-QAP gate's reliability ceiling):
+python src/cbd_analysis.py --reliability      # -> s_odd_reliability.parquet
+
+# classical-null per-window-dense stats for the networks MR-QAP null baseline:
+python src/cbd_analysis.py --null-gate-stats --gate-windows 6 --gate-nodes 60
+#   -> classical_null_gate_stats.parquet (same schema, source='classical_null').
 ```
 `--crisis-source` auto-detects file type: a `vix` column → window labeled crisis
 when its mean VIX exceeds the sample-median aggregate (override with
@@ -68,11 +77,17 @@ when its mean VIX exceeds the sample-median aggregate (override with
 when the window overlaps a recession span.
 
 `--theta-quantile` (default `0.5`, the spec's median) sets the per-stock,
-within-window |R| quantile that splits large- vs small-move regimes. At high
-theta the large-move regime gets rare and the four-cell CHSH structure loses
-support (strict N_min=10 → the valid denominator collapses): that is the method's
-well-posedness boundary, not a failure of deflation. The relaxed-N_min sweep
-points are a small-sample diagnostic only — never a result.
+within-window |R| quantile that splits large- vs small-move regimes. The sweep has
+**two roles**: the sub-median points `{0.25, 0.40, 0.50}` keep the both-large (E00)
+cell populated and test the **robustness of the deflation**; `{0.75, 0.90, 0.95}`
+document the **well-posedness boundary**. The boundary is **two-sided**: at low
+theta the both-*small* cell (N11) collapses and at high theta the both-*large* cell
+(N00) collapses, so under strict N_min=10 only `θ ≈ 0.40–0.50` is well-posed (the
+valid denominator collapses to 0 outside that band over a ~63-day window). Every
+"relaxed-N_min, noise not contextuality" claim is reported **null-relative**: next
+to the empirical relaxed rate the sweep logs the classical-null ctx>0 and a
+cell-size-matched finite-N floor; if the empirical rate exceeds both, it is flagged
+loudly (it is then a boundary artifact to characterize, not a clean noise claim).
 
 ## Stage 3 — figures (offline, reads parquet only)
 ```
@@ -99,10 +114,17 @@ the network analog of the naïve violation rate). It reports edge density,
 clustering, giant-component fraction and modularity (crisis vs calm and over
 time), and runs the three-tier **MR-QAP** gate `pooled → e00 → s_odd` to test
 whether `s_odd` adds structure beyond tail coupling (writes `network_metrics.parquet`
-and `network_qap.parquet`). The reader streams window-by-window, so pointing
-`--stats-file` at a partitioned directory of per-window shards scales to the full
-panel. The `sector_map` argument is a carried hook for a later agricultural
-node-filter; no filtering is done here.
+and `network_qap.parquet`). The gate is reported **null- and noise-relative**: if a
+`classical_null_gate_stats` frame (from `cbd_analysis.py --null-gate-stats`) and an
+`s_odd_reliability` frame (`--reliability`) are present, it also runs the same gate
+on the classical null and reports `real R²` vs `null R²` against the s_odd
+reliability ceiling — structure beyond E00 must clear **both** the null and the
+ceiling (writes `network_gate_summary.parquet`, fig p). The crisis-taxonomy overlay
+is broken out as `network_metrics.crisis_types` and fig o (metrics by crisis type).
+`--gate-nodes` (default 60) aligns the real gate with the null-gate node support.
+The reader streams window-by-window, so pointing `--stats-file` at a partitioned
+directory of per-window shards scales to the full panel. The `sector_map` argument
+is a carried hook for a later agricultural node-filter; no filtering is done here.
 
 ## Crisis taxonomy (overlay)
 `config/crises.csv` lists named crisis sub-periods (1990–2025) with a type label
