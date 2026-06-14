@@ -142,8 +142,16 @@ def detect_return_column(db):
 def get_daily_returns(db, permnos, start, end):
     """Daily returns panel from crsp.dsf_v2, chunked by PERMNO to respect query limits."""
     ret_col, cols = detect_return_column(db)
-    extra = [c for c in ("prc", "vol", "shrout") if c in cols]
-    select_cols = ["permno", "date", f"{ret_col} as ret"] + extra
+    # CIZ (_v2) renamed the date/price/volume fields (date -> dlycaldt, prc -> dlyprc,
+    # vol -> dlyvol). Detect them the same way as the return column and alias back to
+    # the stable output schema (date, ret, [prc, vol, shrout]) so downstream is unchanged.
+    date_col = next((c for c in ("date", "dlycaldt", "caldt") if c in cols), "date")
+    select_cols = ["permno", f"{date_col} as date", f"{ret_col} as ret"]
+    for want, cands in (("prc", ("prc", "dlyprc")), ("vol", ("vol", "dlyvol")),
+                        ("shrout", ("shrout", "dlyshrout"))):
+        hit = next((c for c in cands if c in cols), None)
+        if hit:
+            select_cols.append(f"{hit} as {want}")
 
     permnos = sorted({int(p) for p in permnos})
     n_batches = math.ceil(len(permnos) / PERMNO_BATCH)
@@ -156,7 +164,7 @@ def get_daily_returns(db, permnos, start, end):
             f"""
             select {", ".join(select_cols)}
             from crsp.dsf_v2
-            where date between '{start}' and '{end}'
+            where {date_col} between '{start}' and '{end}'
               and permno in ({in_list})
             """,
             date_cols=["date"],
