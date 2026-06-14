@@ -416,47 +416,58 @@ def qap_hierarchy(stats_path: str, n_perm: int = 199, max_windows: Optional[int]
 
 def gate_null_relative_summary(real_qap: pd.DataFrame,
                                null_qap: Optional[pd.DataFrame] = None,
-                               reliability: Optional[pd.DataFrame] = None) -> dict:
+                               reliability: Optional[pd.DataFrame] = None,
+                               n_boot: int = 2000, seed: int = 0) -> dict:
     """Collapse the per-window gate into a NULL- and NOISE-RELATIVE headline.
 
     The gate R^2 is how much of s_odd is explained by pooled + E00 (tail coupling).
-    Read on its own, (1 - R^2) overstates novelty because part of the residual is
-    just sampling noise. So we compare real R^2 to the classical-null R^2 (no
-    contextual ingredient) and bound it by the s_odd reliability ceiling:
-      * real R^2 ~= null R^2  => s_odd's relation to tail coupling is the same as
-        under the null => the CHSH combination is decoration (tail-coupling paper).
-      * real R^2 << null R^2  => real s_odd carries MORE unexplained structure than
-        the null (candidate genuine signal), to be judged against the reliability
-        ceiling (a network cannot encode structure beyond its edge reliability).
-    `excess_residual = null_R2 - real_R2` is the residual structure in real beyond
-    the null; values within (1 - reliability^2) are inside the noise floor.
+    Read on its own, (1 - R^2) overstates novelty because pooled/E00/s_odd share
+    estimation noise, so the predictors fit noise too and inflate R^2. The verdict
+    therefore rests on the NULL-RELATIVE difference d = real_R2 - null_R2 (the
+    classical null has no contextual ingredient; only the difference cancels the
+    shared noise). We pair d per-window and bootstrap a CI over windows:
+      * CI for d straddling 0 (and small) => s_odd ~ tail-coupling artifact (CHSH is
+        decoration; points to the tail-coupling network paper).
+      * d significantly < 0 => real s_odd has MORE residual structure than the null
+        (candidate signal), to be judged against the reliability ceiling.
+    Reliability (regime-preserving split-half, Spearman-Brown) is reported as the
+    ceiling on attainable R^2; it is shown on the figure only when the bars do not
+    exceed it (otherwise reported qualitatively).
     """
     def _m(df, c):
         return float(df[c].mean()) if (df is not None and len(df) and c in df.columns) else np.nan
-    real_r2 = _m(real_qap, "gate_r2_s_odd_on_pooled_e00")
-    null_r2 = _m(null_qap, "gate_r2_s_odd_on_pooled_e00")
+    col = "gate_r2_s_odd_on_pooled_e00"
+    real_r2 = _m(real_qap, col)
+    null_r2 = _m(null_qap, col)
     rel_sb = _m(reliability, "reliability_sb")
-    excess = (null_r2 - real_r2) if (np.isfinite(real_r2) and np.isfinite(null_r2)) else np.nan
-    noise_floor = (1 - rel_sb ** 2) if np.isfinite(rel_sb) else np.nan
-    summ = {"real_gate_r2": real_r2, "null_gate_r2": null_r2,
-            "reliability_sb": rel_sb, "noise_floor_1_minus_rel2": noise_floor,
-            "excess_residual": excess,
+    summ = {"real_gate_r2": real_r2, "null_gate_r2": null_r2, "reliability_sb": rel_sb,
             "r_e00_s_odd_real": _m(real_qap, "r_e00_s_odd"),
-            "r_e00_s_odd_null": _m(null_qap, "r_e00_s_odd")}
-    if np.isfinite(real_r2) and np.isfinite(null_r2):
-        if abs(real_r2 - null_r2) < 0.05:
-            log.info(f"GATE VERDICT: real R^2={real_r2:.3f} ~= null R^2={null_r2:.3f} "
-                     f"=> s_odd structure ~ tail-coupling artifact (CHSH is decoration; "
-                     f"points to the tail-coupling network paper).")
-        elif real_r2 < null_r2 - 0.05:
-            log.info(f"GATE VERDICT: real R^2={real_r2:.3f} < null R^2={null_r2:.3f} "
-                     f"(excess residual {excess:.3f}; s_odd reliability SB={rel_sb:.3f}, "
-                     f"noise floor {noise_floor:.3f}) => real s_odd carries structure "
-                     f"beyond tail coupling above the null; judge vs the ceiling.")
-        else:
-            log.info(f"GATE VERDICT: real R^2={real_r2:.3f} > null R^2={null_r2:.3f} "
-                     f"=> s_odd is MORE explained by tail coupling than the null; no "
-                     f"evidence of structure beyond E00.")
+            "r_e00_s_odd_null": _m(null_qap, "r_e00_s_odd"),
+            "diff_real_minus_null": np.nan, "diff_ci_lo": np.nan, "diff_ci_hi": np.nan,
+            "n_gate_windows": 0}
+    # paired per-window difference + bootstrap CI over windows
+    if (real_qap is not None and null_qap is not None and len(real_qap) and len(null_qap)
+            and col in real_qap.columns and col in null_qap.columns):
+        merged = real_qap[["window_id", col]].merge(
+            null_qap[["window_id", col]], on="window_id", suffixes=("_real", "_null"))
+        d = (merged[col + "_real"] - merged[col + "_null"]).dropna().to_numpy()
+        if len(d):
+            rng = np.random.default_rng(seed)
+            boot = np.array([rng.choice(d, len(d), replace=True).mean()
+                             for _ in range(int(n_boot))])
+            summ.update(diff_real_minus_null=float(d.mean()),
+                        diff_ci_lo=float(np.percentile(boot, 2.5)),
+                        diff_ci_hi=float(np.percentile(boot, 97.5)),
+                        n_gate_windows=int(len(d)))
+    d_, lo, hi = summ["diff_real_minus_null"], summ["diff_ci_lo"], summ["diff_ci_hi"]
+    if np.isfinite(d_):
+        straddles = (lo <= 0 <= hi)
+        verdict = ("s_odd ~ tail-coupling artifact (CHSH decoration)" if (straddles or d_ >= 0)
+                   else "real s_odd has residual structure beyond the null; judge vs ceiling")
+        log.info(f"GATE VERDICT: real R^2={real_r2:.3f}, null R^2={null_r2:.3f}, "
+                 f"d=real-null={d_:+.3f} [95% CI {lo:+.3f},{hi:+.3f}] over "
+                 f"{summ['n_gate_windows']} windows; reliability SB={rel_sb:.3f} "
+                 f"=> {verdict}.")
     else:
         log.info(f"GATE: real R^2={real_r2:.3f} (no null baseline supplied).")
     return summ
@@ -467,6 +478,11 @@ def gate_null_relative_summary(real_qap: pd.DataFrame,
 # ==========================================================================
 _METRICS = [("edge_density", "edge density"), ("avg_clustering", "avg clustering"),
             ("giant_frac", "giant-component frac"), ("modularity", "modularity")]
+
+# H3: lead with pooled (baseline) and E00 (canonical tail coupling); s_odd is the
+# CONTROL the MR-QAP gate rules out (no structure beyond E00).
+GRAPH_LABELS = {"pooled": "pooled\n(baseline)", "e00": "E00\n(canonical)",
+                "s_odd": "s_odd\n(control)"}
 
 
 def plot_network_metrics_crisis_calm(metrics: pd.DataFrame) -> Figure:
@@ -488,13 +504,15 @@ def plot_network_metrics_crisis_calm(metrics: pd.DataFrame) -> Figure:
             vals = [means.get((k, reg), np.nan) for k in kinds]
             ax.bar(x + (i - 0.5) * wbar, vals, wbar, label=reg,
                    color=REGIME_COLORS.get(reg))
-        ax.set_xticks(x); ax.set_xticklabels(kinds)
+        ax.set_xticks(x); ax.set_xticklabels([GRAPH_LABELS.get(k, k) for k in kinds],
+                                             fontsize=9)
         ax.set_title(lab); ax.set_ylabel(lab)
     axes.ravel()[0].legend(title="regime", fontsize=9)
     fig.suptitle("Density-matched network topology: crisis vs calm",
                  fontweight="bold")
-    _caption(fig, "Top-q% density-matched graphs (pooled correlation, E00 tail "
-                  "coupling, s_odd); bars = mean over windows.")
+    _caption(fig, "Lead exhibits are pooled (correlation baseline) and E00 (canonical "
+                  "tail coupling); s_odd is the CONTROL the MR-QAP gate rules out (no "
+                  "structure beyond E00). Top-q% density-matched; bars = mean over windows.")
     fig.tight_layout(rect=(0, 0.03, 1, 0.97))
     return fig
 
@@ -536,17 +554,21 @@ def plot_network_metrics_over_time(metrics: pd.DataFrame, metric: str = "giant_f
     fig, ax = plt.subplots(figsize=(9, 5))
     _shade_crisis(ax, reg_tbl)
     palette = {"pooled": OKABE["grey"], "e00": OKABE["blue"], "s_odd": OKABE["vermillion"]}
+    styles = {"pooled": "--", "e00": "-", "s_odd": ":"}     # E00 solid = canonical
+    labels = {"pooled": "pooled (baseline)", "e00": "E00 (canonical)",
+              "s_odd": "s_odd (control)"}
     for kind in GRAPH_KINDS:
         dk = dens[dens["graph"] == kind].sort_values("win_start")
         if dk.empty:
             continue
         ax.plot(dk["win_start"], dk[metric], marker="o", ms=3, color=palette[kind],
-                label=kind)
+                ls=styles.get(kind, "-"), label=labels.get(kind, kind))
     ax.set_ylabel(dict(_METRICS).get(metric, metric))
     ax.set_xlabel("window start")
     ax.set_title(f"{dict(_METRICS).get(metric, metric)} over time (crisis shaded)")
     ax.legend(fontsize=9)
-    _caption(fig, "Density-matched graphs; shaded spans = crisis windows (VIX/NBER label).")
+    _caption(fig, "E00 (canonical tail coupling) solid; pooled baseline dashed; s_odd "
+                  "control dotted. Shaded spans = crisis windows (VIX/NBER label).")
     fig.tight_layout(rect=(0, 0.03, 1, 1))
     return fig
 
@@ -585,8 +607,10 @@ def plot_metrics_by_crisis_type(metrics: pd.DataFrame, metric: str = "modularity
 
 
 def plot_gate_null_relative(summary: dict) -> Figure:
-    """Null- and noise-relative gate headline: real vs classical-null R^2 of
-    s_odd ~ pooled + E00, with the s_odd reliability ceiling annotated."""
+    """Null- and noise-relative gate headline for the s_odd CONTROL: real vs
+    classical-null R^2 of s_odd ~ pooled + E00, with the bootstrapped (real-null)
+    R^2 difference and CI. The reliability ceiling is drawn only when the bars do
+    not exceed it (a ceiling the bars clear would be misleading)."""
     name = "fig_p_gate_null_relative"
     real_r2 = summary.get("real_gate_r2", np.nan)
     if not np.isfinite(real_r2):
@@ -601,19 +625,32 @@ def plot_gate_null_relative(summary: dict) -> Figure:
            color=[OKABE["vermillion"], OKABE["grey"]][:len(bars)], width=0.55)
     for i, v in enumerate(bars.values()):
         ax.text(i, v, f"{v:.2f}", ha="center", va="bottom", fontsize=11)
-    if np.isfinite(rel):
+    bar_max = max(bars.values())
+    # draw the reliability ceiling ONLY if the bars do not exceed it
+    if np.isfinite(rel) and rel >= bar_max:
         ax.axhline(rel, ls="--", color=OKABE["green"],
                    label=f"s_odd reliability ceiling (SB r={rel:.2f})")
         ax.legend(fontsize=9)
     ax.set_ylim(0, 1)
     ax.set_ylabel(r"$R^2$ of  s_odd ~ pooled + E00")
-    ax.set_title("Does s_odd add structure beyond tail coupling?")
-    excess = summary.get("excess_residual", np.nan)
-    sub = ("real \u2248 null \u21d2 tail-coupling artifact"
-           if (np.isfinite(null_r2) and abs(real_r2 - null_r2) < 0.05)
-           else f"excess residual (null\u2212real R\u00b2) = {excess:.2f}")
-    _caption(fig, f"Null-relative gate: {sub}. Structure beyond E00 must clear both "
-                  f"the null and the reliability ceiling.")
+    ax.set_title("s_odd control: no structure beyond E00 tail coupling")
+    d = summary.get("diff_real_minus_null", np.nan)
+    lo, hi = summary.get("diff_ci_lo", np.nan), summary.get("diff_ci_hi", np.nan)
+    if np.isfinite(d):
+        rel_txt = (f"reliability SB r={rel:.2f}" if np.isfinite(rel) else "")
+        rel_note = ("" if (np.isfinite(rel) and rel >= bar_max)
+                    else f" (R\u00b2 exceeds {rel_txt}; ceiling shown qualitatively only)")
+        if np.isfinite(lo) and lo <= 0 <= hi:
+            verdict = "CI straddles 0 \u21d2 s_odd \u2248 tail coupling"
+        elif d >= 0:
+            verdict = "real \u2265 null \u21d2 s_odd even more tied to tail coupling (decoration)"
+        else:
+            verdict = "real < null \u21d2 residual structure beyond E00"
+        sub = (f"d = real\u2212null R\u00b2 = {d:+.2f} [95% CI {lo:+.2f}, {hi:+.2f}]; "
+               + verdict + rel_note)
+    else:
+        sub = "no null baseline supplied"
+    _caption(fig, f"Null-relative gate: {sub}.")
     fig.tight_layout(rect=(0, 0.03, 1, 1))
     return fig
 
@@ -807,8 +844,9 @@ def run_tests() -> None:
         # null-relative gate summary (null frame ~ shifted real frame here)
         null_like = qdf.assign(gate_r2_s_odd_on_pooled_e00=qdf["gate_r2_s_odd_on_pooled_e00"])
         rel = pd.DataFrame({"window_id": [0, 1], "reliability_sb": [0.7, 0.72]})
-        summ = gate_null_relative_summary(qdf, null_like, rel)
-        assert {"real_gate_r2", "null_gate_r2", "reliability_sb", "excess_residual"} <= set(summ)
+        summ = gate_null_relative_summary(qdf, null_like, rel, n_boot=200)
+        assert {"real_gate_r2", "null_gate_r2", "reliability_sb",
+                "diff_real_minus_null", "diff_ci_lo", "diff_ci_hi"} <= set(summ)
 
         # every figure returns a Figure
         for fig in (plot_network_metrics_crisis_calm(metrics),

@@ -140,19 +140,27 @@ def compute_pair_window(a, b, x, y, n_min):
 # ==========================================================================
 # PER-WINDOW DRIVER
 # ==========================================================================
-def _run_window_loop(window_id, win_start, win_end, permnos, ret_wide, n_min, theta_q=0.5):
+def _run_window_loop(window_id, win_start, win_end, permnos, ret_wide, n_min,
+                     theta_q=0.5, thresholds=None):
     """Reference O(n^2) implementation. Kept verbatim as the correctness oracle
     for `run_window` (see `_test_vectorized_equivalence`). Not called in the hot
     path. Compute CbD stats for every eligible pair in one window.
     ret_wide : DataFrame indexed by date, columns = permno, values = ret,
                already restricted to this window's trading days and permnos.
     theta_q  : per-stock |R| quantile defining the large/small regime split.
+    thresholds : optional {permno: theta} to FIX the per-stock regime threshold
+                 instead of recomputing it on `ret_wide` (used by the
+                 regime-preserving split-half reliability). This changes only the
+                 threshold selection, never the locked s_odd/delta/ctx formulas.
     Returns a list of result dicts (one per valid-or-invalid pair).
     """
     cols = [p for p in permnos if p in ret_wide.columns]
     R = ret_wide[cols]
     absR = R.abs()
-    thetas = {p: window_threshold(absR[p].dropna().values, theta_q) for p in cols}
+    if thresholds is not None:
+        thetas = {p: thresholds.get(p, np.nan) for p in cols}
+    else:
+        thetas = {p: window_threshold(absR[p].dropna().values, theta_q) for p in cols}
     sign = {p: np.sign(R[p].values) for p in cols}                 # in {-1,0,1}
     regime = {p: assign_regime(absR[p].values, thetas[p]) for p in cols}
 
@@ -190,7 +198,8 @@ def _safe_div(num, den):
     return out
 
 
-def run_window(window_id, win_start, win_end, permnos, ret_wide, n_min, theta_q=0.5):
+def run_window(window_id, win_start, win_end, permnos, ret_wide, n_min, theta_q=0.5,
+               thresholds=None):
     """Vectorized per-window driver. Mathematically identical to
     `_run_window_loop` (asserted bit-for-bit in `_test_vectorized_equivalence`),
     but replaces the O(n^2) Python pair loop + per-pair boolean masking with a
@@ -199,6 +208,10 @@ def run_window(window_id, win_start, win_end, permnos, ret_wide, n_min, theta_q=
     ret_wide : DataFrame indexed by date, columns = permno, values = ret,
                already restricted to this window's trading days and permnos.
     theta_q  : per-stock |R| quantile defining the large/small regime split.
+    thresholds : optional {permno: theta} to FIX the per-stock regime threshold
+                 instead of recomputing it on `ret_wide` (regime-preserving
+                 split-half reliability). Threshold selection only -- the locked
+                 s_odd/delta/ctx formulas are unchanged.
     Returns a list of result dicts (one per pair), in `combinations(cols, 2)`
     order so callers see the same ordering as the reference loop.
     """
@@ -214,11 +227,15 @@ def run_window(window_id, win_start, win_end, permnos, ret_wide, n_min, theta_q=
     sgn[nan] = 0.0                                          # keep matmuls NaN-free
     valid = (~nan) & (sgn != 0.0)                          # per-stock usable days
 
-    # Per-stock threshold = q-quantile of finite |R| over the window (== loop).
-    thetas = np.empty(S)
-    for i in range(S):
-        col = absR[~nan[:, i], i]
-        thetas[i] = np.quantile(col, theta_q) if col.size else np.nan
+    # Per-stock threshold = q-quantile of finite |R| over the window (== loop),
+    # unless fixed thresholds are injected (regime-preserving reliability).
+    if thresholds is not None:
+        thetas = np.array([thresholds.get(cols[i], np.nan) for i in range(S)])
+    else:
+        thetas = np.empty(S)
+        for i in range(S):
+            col = absR[~nan[:, i], i]
+            thetas[i] = np.quantile(col, theta_q) if col.size else np.nan
     with np.errstate(invalid="ignore"):
         large = absR >= thetas[None, :]                    # NaN -> False -> small
 
@@ -928,7 +945,7 @@ def analyze(data_dir, out_path, n_min, sample=None, crisis_source=None,
 # ==========================================================================
 # STEP 2 -- PERCENTILE-THRESHOLD ROBUSTNESS SWEEP
 # ==========================================================================
-def sweep_thresholds(data_dir, quantiles=(0.25, 0.40, 0.50, 0.75, 0.90, 0.95),
+def sweep_thresholds(data_dir, quantiles=(0.25, 0.40, 0.42, 0.45, 0.48, 0.50, 0.75, 0.90, 0.95),
                      n_min=10, crisis_source=None, crisis_threshold=None, sample=None,
                      relaxed_n_min=3, relaxed_quantiles=(0.90, 0.95),
                      null_relative=True, null_cap=3000, seed=0):
@@ -1066,24 +1083,23 @@ def sweep_thresholds(data_dir, quantiles=(0.25, 0.40, 0.50, 0.75, 0.90, 0.95),
 
 
 def s_odd_split_half_reliability(elig, ret, *, n_min=10, theta_q=0.5, sample=None,
-                                 seed=0, half_n_min=None):
-    """Per-window s_odd RELIABILITY ceiling (supports the MR-QAP gate framing).
+                                 seed=0, half_min_cell=2):
+    """Per-window s_odd REGIME-PRESERVING split-half reliability.
 
-    Split each window's trading days into two interleaved halves (even/odd days,
-    so both halves see the same regime mix), recompute s_odd per pair on each half
-    with the SAME estimator, and correlate the two edge-weight vectors over pairs
-    valid in both halves. The half-split Pearson r is corrected to a full-length
-    estimate by Spearman-Brown (r_sb = 2r/(1+r)). This is the ceiling against which
-    any 's_odd structure beyond tail coupling' must be judged: a network can only
-    encode structure up to the reliability of its edge weights.
+    The pitfall of a naive day-halving split is that recomputing theta on each half
+    changes which days are large/small, so the two halves no longer measure the same
+    four-cell construct (the parallel-test assumption fails) and the reliability is
+    biased low. Here we instead FIX each stock's per-stock threshold at its FULL-
+    window theta_q-quantile (`thresholds=` injected into run_window), assign regimes
+    once, and split the days odd/even. Both halves then share identical per-day
+    regime labels, so they are genuine parallel sub-tests; the half-length Pearson r
+    is corrected to full length by Spearman-Brown (r_sb = 2r/(1+r)).
 
-    Each half has ~half the days, which cannot support the full N_min across four
-    cells, so the halves use a relaxed `half_n_min` (default max(3, n_min//2)); the
-    resulting r is a (conservative) reliability estimate at reduced N. Computed here
-    (not in networks.py) because it needs the per-DAY series only the driver has.
-    Returns one row per window.
+    Reliability is computed over pairs that are valid at the full N_min in the full
+    window; a half contributes a pair's s_odd as long as each of its four cells has
+    >= `half_min_cell` days. Computed here (not in networks.py) because it needs the
+    per-DAY series only the driver has. Returns one row per window.
     """
-    half_n_min = half_n_min if half_n_min is not None else max(3, n_min // 2)
     window_ids = sorted(elig.window_id.unique())
     if sample:
         window_ids = window_ids[:sample]
@@ -1092,16 +1108,30 @@ def s_odd_split_half_reliability(elig, ret, *, n_min=10, theta_q=0.5, sample=Non
     rows = []
     for wid, ws, we, permnos, ret_wide in _iter_window_panels(elig, ret, window_ids, win_bounds):
         rw = ret_wide.sort_index()
-        ha, hb = rw.iloc[0::2], rw.iloc[1::2]              # interleaved halves
-        if len(ha) < 4 * half_n_min or len(hb) < 4 * half_n_min:
+        cols = [p for p in permnos if p in rw.columns]
+        if rw.shape[0] < 8 or len(cols) < 3:
             continue
+        absR = rw[cols].abs()
+        # full-window per-stock thresholds (identical regime definition to analysis)
+        thr = {p: window_threshold(absR[p].dropna().values, theta_q)
+               for p in cols if absR[p].notna().any()}
+        # pairs valid at the full N_min in the full window (the reliability universe)
+        full_valid = {(r["permno_a"], r["permno_b"])
+                      for r in run_window(wid, ws, we, cols, rw, n_min,
+                                          theta_q=theta_q, thresholds=thr)
+                      if r["valid"]}
+        if len(full_valid) < 3:
+            continue
+        ha, hb = rw.iloc[0::2], rw.iloc[1::2]              # parallel odd/even halves
         sa = {(r["permno_a"], r["permno_b"]): r["s_odd"]
-              for r in run_window(wid, ws, we, permnos, ha, half_n_min, theta_q=theta_q)
+              for r in run_window(wid, ws, we, cols, ha, half_min_cell,
+                                  theta_q=theta_q, thresholds=thr)
               if r["valid"] and not np.isnan(r["s_odd"])}
         sb = {(r["permno_a"], r["permno_b"]): r["s_odd"]
-              for r in run_window(wid, ws, we, permnos, hb, half_n_min, theta_q=theta_q)
+              for r in run_window(wid, ws, we, cols, hb, half_min_cell,
+                                  theta_q=theta_q, thresholds=thr)
               if r["valid"] and not np.isnan(r["s_odd"])}
-        common = set(sa) & set(sb)
+        common = [k for k in full_valid if k in sa and k in sb]
         if len(common) < 3:
             continue
         va = np.array([sa[k] for k in common]); vb = np.array([sb[k] for k in common])
@@ -1115,8 +1145,9 @@ def s_odd_split_half_reliability(elig, ret, *, n_min=10, theta_q=0.5, sample=Non
                  f"N_common={len(common):,}")
     df = pd.DataFrame(rows)
     if len(df):
-        log.info(f"s_odd reliability: mean half-split r={df.reliability_halfsplit.mean():.3f}, "
-                 f"mean Spearman-Brown r={df.reliability_sb.mean():.3f}")
+        log.info(f"s_odd reliability (regime-preserving): mean half-split "
+                 f"r={df.reliability_halfsplit.mean():.3f}, mean Spearman-Brown "
+                 f"r={df.reliability_sb.mean():.3f}")
     return df
 
 
@@ -1564,7 +1595,7 @@ def parse_args():
     return ap.parse_args()
 
 
-_DEFAULT_SWEEP = (0.25, 0.40, 0.50, 0.75, 0.90, 0.95)
+_DEFAULT_SWEEP = (0.25, 0.40, 0.42, 0.45, 0.48, 0.50, 0.75, 0.90, 0.95)
 
 
 if __name__ == "__main__":

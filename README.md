@@ -59,7 +59,8 @@ python src/cbd_analysis.py --null --null-max-pairs 5000
 
 # magnitude-threshold robustness sweep (theta = per-stock |R| quantile):
 python src/cbd_analysis.py --sweep --crisis-source nber   # bare --sweep = default set
-#   default {0.25,0.40,0.50,0.75,0.90,0.95}; or pass --sweep "0.25,0.5,0.9".
+#   default {0.25,0.40,0.42,0.45,0.48,0.50,0.75,0.90,0.95} — a fine in-band grid
+#   (0.40–0.50) plus boundary points; or pass --sweep "0.25,0.5,0.9".
 #   -> wrds_sp500_data/threshold_sweep.parquet (strict N_min headline; relaxed-N_min
 #      DIAGNOSTIC at high quantiles, reported NULL-RELATIVE: classical-null ctx>0 and
 #      a cell-size-matched finite-N ctx>0 floor next to the empirical relaxed rate).
@@ -116,10 +117,13 @@ time), and runs the three-tier **MR-QAP** gate `pooled → e00 → s_odd` to tes
 whether `s_odd` adds structure beyond tail coupling (writes `network_metrics.parquet`
 and `network_qap.parquet`). The gate is reported **null- and noise-relative**: if a
 `classical_null_gate_stats` frame (from `cbd_analysis.py --null-gate-stats`) and an
-`s_odd_reliability` frame (`--reliability`) are present, it also runs the same gate
-on the classical null and reports `real R²` vs `null R²` against the s_odd
-reliability ceiling — structure beyond E00 must clear **both** the null and the
-ceiling (writes `network_gate_summary.parquet`, fig p). The crisis-taxonomy overlay
+`s_odd_reliability` frame (`--reliability`, a **regime-preserving** split-half
+estimate) are present, it also runs the same gate on the classical null and reports
+the bootstrapped paired difference `d = real R² − null R²` with a 95% CI over
+windows (writes `network_gate_summary.parquet`, fig p). The verdict rests on `d`
+(the shared estimation noise cancels in the difference), not on `1 − R²`; the
+reliability ceiling is drawn only when the bars don't exceed it. s_odd leads as the
+**control** the gate rules out. The crisis-taxonomy overlay
 is broken out as `network_metrics.crisis_types` and fig o (metrics by crisis type).
 `--gate-nodes` (default 60) aligns the real gate with the null-gate node support.
 The reader streams window-by-window, so pointing `--stats-file` at a partitioned

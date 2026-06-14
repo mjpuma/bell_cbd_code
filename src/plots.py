@@ -500,20 +500,21 @@ def plot_threshold_sweep(sweep: pd.DataFrame) -> Figure:
             ax.scatter(100 * fl["theta_q"], 100 * fl["cbd_rate_smallN_floor"],
                        color=OKABE["green"], marker="_", s=260, zorder=7, linewidths=2.2,
                        label="finite-N ctx>0 floor")
-    ax.set_xlabel(r"$\theta$ percentile of $|R|$  (regime 0 = large-move, $|R|\geq\theta$)")
+    ax.set_xlabel(r"$\theta$ percentile of $|R|$  (well-posed band $\approx$ 0.40–0.50)")
     ax.set_ylabel("CbD-corrected rate, CTX>0 (%)")
     ax.set_ylim(bottom=0)
     ax2.set_ylabel("valid pair-windows (dotted, log)")
     ax2.set_yscale("log")
     ax2.grid(False)
-    ax.set_title("Deflation stability across the magnitude threshold")
+    ax.set_title("Well-posedness map: deflation across the magnitude threshold")
     h1, l1 = ax.get_legend_handles_labels()
     if h1:
         ax.legend(loc="upper left", fontsize=9)
-    _caption(fig, "Solid = strict-N_min CbD rate; squares = relaxed-N_min diagnostic, "
-                  "compared to x = classical-null and \u2014 = cell-size-matched finite-N "
-                  "floor (same condition); dotted = valid denominator (log) = "
-                  "well-posedness boundary. Strict rate \u2248 0 across the well-posed band.")
+    _caption(fig, "Well-posedness map: deflation (CTX>0 \u2248 0) holds across the well-posed "
+                  "band ~0.40\u20130.50; outside it the four cells can't be jointly populated "
+                  "(N11 starves below ~0.40, N00 above ~0.50) and the valid denominator "
+                  "(dotted, log) collapses. Squares = relaxed-N_min diagnostic vs x = "
+                  "classical-null and \u2014 = cell-size-matched finite-N floor.")
     fig.tight_layout(rect=(0, 0.03, 1, 1))
     return fig
 
@@ -652,7 +653,7 @@ def _synthetic_panel():
 def _synthetic_sweep() -> pd.DataFrame:
     """Tiny synthetic threshold_sweep frame for the (j) smoke test."""
     rows = []
-    for q in (0.25, 0.40, 0.50, 0.75, 0.90, 0.95):
+    for q in (0.25, 0.40, 0.42, 0.45, 0.48, 0.50, 0.75, 0.90, 0.95):
         diag = q >= 0.90
         for reg, base in (("crisis", 0.0), ("calm", 0.0)):
             rows.append({"theta_q": q, "regime": reg, "n_min": 10, "relaxed_n_min": 3,
