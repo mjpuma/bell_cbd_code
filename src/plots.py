@@ -464,6 +464,48 @@ def plot_ctx_overlay(stats: pd.DataFrame, null_stats: Optional[pd.DataFrame]) ->
 
 
 # ==========================================================================
+# (j) threshold robustness sweep: CbD rate vs theta-percentile
+# ==========================================================================
+def plot_threshold_sweep(sweep: pd.DataFrame) -> Figure:
+    name = "fig_j_threshold_sweep"
+    if _missing(sweep, ("theta_q", "regime", "cbd_rate", "n_valid"), name):
+        return _placeholder("Threshold sweep", "threshold_sweep parquet missing")
+    n_min = int(sweep["n_min"].iloc[0]) if "n_min" in sweep.columns else None
+    rlx = int(sweep["relaxed_n_min"].iloc[0]) if "relaxed_n_min" in sweep.columns else None
+    fig, ax = plt.subplots()
+    ax2 = ax.twinx()
+    for reg in ("crisis", "calm"):
+        d = sweep[sweep["regime"] == reg].sort_values("theta_q")
+        if d.empty:
+            continue
+        col = REGIME_COLORS.get(reg, OKABE["blue"])
+        ax.plot(100 * d["theta_q"], 100 * d["cbd_rate"], marker="o", color=col,
+                label=f"{reg}: CbD (CTX>0), N_min={n_min}")
+        ax2.plot(100 * d["theta_q"], d["n_valid"].clip(lower=1), color=col, ls=":",
+                 lw=1.2, alpha=0.5)
+        if "is_relaxed_diag_q" in d.columns and "cbd_rate_relaxed" in d.columns:
+            dr = d[d["is_relaxed_diag_q"]]
+            if len(dr):
+                ax.scatter(100 * dr["theta_q"], 100 * dr["cbd_rate_relaxed"],
+                           facecolors="none", edgecolors=col, marker="s", s=90, zorder=5,
+                           label=f"{reg}: relaxed N_min={rlx} (small-N diag)")
+    ax.set_xlabel(r"$\theta$ percentile of $|R|$  (regime 0 = large-move, $|R|\geq\theta$)")
+    ax.set_ylabel("CbD-corrected rate, CTX>0 (%)")
+    ax.set_ylim(bottom=0)
+    ax2.set_ylabel("valid pair-windows (dotted, log)")
+    ax2.set_yscale("log")
+    ax2.grid(False)
+    ax.set_title("Deflation stability across the magnitude threshold")
+    h1, l1 = ax.get_legend_handles_labels()
+    if h1:
+        ax.legend(loc="upper left", fontsize=9)
+    _caption(fig, "Solid = strict-N_min CbD rate; squares = relaxed-N_min small-sample "
+                  "diagnostic (not a result); dotted = valid denominator (well-posedness boundary).")
+    fig.tight_layout(rect=(0, 0.03, 1, 1))
+    return fig
+
+
+# ==========================================================================
 # (optional) sector-stratified headline exhibit
 # ==========================================================================
 def plot_violation_rates_by_sector(stats: pd.DataFrame, sector_map: dict) -> Figure:
@@ -531,6 +573,7 @@ def build_all(data_dir: str, out_dir: str, stats_file: Optional[str] = None,
     elig = _read_optional(os.path.join(data_dir, "window_eligibility"))
     returns = _read_optional(os.path.join(data_dir, "daily_returns"))
     null_stats = _read_optional(null_file or os.path.join(data_dir, "classical_null_stats"))
+    sweep = _read_optional(os.path.join(data_dir, "threshold_sweep"))
     sector_map = load_sector_map(data_dir)
 
     figs = {
@@ -543,6 +586,7 @@ def build_all(data_dir: str, out_dir: str, stats_file: Optional[str] = None,
         "fig_g_violation_rates": lambda: plot_violation_rates(stats),
         "fig_h_sodd_vs_delta": lambda: plot_sodd_vs_delta(stats),
         "fig_i_ctx_overlay": lambda: plot_ctx_overlay(stats, null_stats),
+        "fig_j_threshold_sweep": lambda: plot_threshold_sweep(sweep),
         "fig_g_sector_violation_rates": lambda: plot_violation_rates_by_sector(stats, sector_map),
     }
     for name, fn in figs.items():
@@ -592,6 +636,21 @@ def _synthetic_panel():
     return ret, elig
 
 
+def _synthetic_sweep() -> pd.DataFrame:
+    """Tiny synthetic threshold_sweep frame for the (j) smoke test."""
+    rows = []
+    for q in (0.5, 0.75, 0.90, 0.95):
+        diag = q >= 0.90
+        for reg, base in (("crisis", 0.0), ("calm", 0.0)):
+            rows.append({"theta_q": q, "regime": reg, "n_min": 10, "relaxed_n_min": 3,
+                         "n_valid": int(5000 * (1 - q)), "naive_rate": 0.05,
+                         "cbd_rate": base, "n_valid_relaxed": int(9000 * (1 - q)),
+                         "naive_rate_relaxed": 0.06,
+                         "cbd_rate_relaxed": 0.02 if diag else 0.0,
+                         "is_relaxed_diag_q": diag})
+    return pd.DataFrame(rows)
+
+
 def run_tests() -> None:
     """Each plotting function must return a valid Figure on synthetic input."""
     set_style()
@@ -608,6 +667,7 @@ def run_tests() -> None:
         ("g", plot_violation_rates(stats)),
         ("h", plot_sodd_vs_delta(stats)),
         ("i", plot_ctx_overlay(stats, null_stats)),
+        ("j", plot_threshold_sweep(_synthetic_sweep())),
         ("g-sector", plot_violation_rates_by_sector(stats, {100: "Tech", 101: "Tech",
                                                             102: "Energy", 103: "Energy",
                                                             104: "Tech", 200: "Health",

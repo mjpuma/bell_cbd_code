@@ -97,10 +97,13 @@ def ctx(E, a_marg, b_marg, n=4):
 # ==========================================================================
 # REGIME CLASSIFICATION + PER-PAIR STATISTICS  (implemented)
 # ==========================================================================
-def window_threshold(abs_ret):
-    """Per-stock magnitude threshold within a window. Spec default: the median
-    of |R| over the window. (Robustness sweep: swap for a fixed quantile.)"""
-    return float(np.median(abs_ret))
+def window_threshold(abs_ret, q=0.5):
+    """Per-stock magnitude threshold within a window: the q-quantile of |R| over
+    the window. Spec default q=0.5 (the median, ~balanced regimes). The robustness
+    sweep raises q so 'large-move' (regime 0, |R| >= theta) becomes rarer; this is
+    the per-stock, within-window quantile (cross-sectional vol differences must NOT
+    enter the regime definition)."""
+    return float(np.quantile(abs_ret, q))
 
 
 def assign_regime(abs_ret, theta):
@@ -137,18 +140,19 @@ def compute_pair_window(a, b, x, y, n_min):
 # ==========================================================================
 # PER-WINDOW DRIVER
 # ==========================================================================
-def _run_window_loop(window_id, win_start, win_end, permnos, ret_wide, n_min):
+def _run_window_loop(window_id, win_start, win_end, permnos, ret_wide, n_min, theta_q=0.5):
     """Reference O(n^2) implementation. Kept verbatim as the correctness oracle
     for `run_window` (see `_test_vectorized_equivalence`). Not called in the hot
     path. Compute CbD stats for every eligible pair in one window.
     ret_wide : DataFrame indexed by date, columns = permno, values = ret,
                already restricted to this window's trading days and permnos.
+    theta_q  : per-stock |R| quantile defining the large/small regime split.
     Returns a list of result dicts (one per valid-or-invalid pair).
     """
     cols = [p for p in permnos if p in ret_wide.columns]
     R = ret_wide[cols]
     absR = R.abs()
-    thetas = {p: window_threshold(absR[p].dropna().values) for p in cols}
+    thetas = {p: window_threshold(absR[p].dropna().values, theta_q) for p in cols}
     sign = {p: np.sign(R[p].values) for p in cols}                 # in {-1,0,1}
     regime = {p: assign_regime(absR[p].values, thetas[p]) for p in cols}
 
@@ -186,7 +190,7 @@ def _safe_div(num, den):
     return out
 
 
-def run_window(window_id, win_start, win_end, permnos, ret_wide, n_min):
+def run_window(window_id, win_start, win_end, permnos, ret_wide, n_min, theta_q=0.5):
     """Vectorized per-window driver. Mathematically identical to
     `_run_window_loop` (asserted bit-for-bit in `_test_vectorized_equivalence`),
     but replaces the O(n^2) Python pair loop + per-pair boolean masking with a
@@ -194,6 +198,7 @@ def run_window(window_id, win_start, win_end, permnos, ret_wide, n_min):
 
     ret_wide : DataFrame indexed by date, columns = permno, values = ret,
                already restricted to this window's trading days and permnos.
+    theta_q  : per-stock |R| quantile defining the large/small regime split.
     Returns a list of result dicts (one per pair), in `combinations(cols, 2)`
     order so callers see the same ordering as the reference loop.
     """
@@ -209,11 +214,11 @@ def run_window(window_id, win_start, win_end, permnos, ret_wide, n_min):
     sgn[nan] = 0.0                                          # keep matmuls NaN-free
     valid = (~nan) & (sgn != 0.0)                          # per-stock usable days
 
-    # Per-stock threshold = median of finite |R| over the window (== loop).
+    # Per-stock threshold = q-quantile of finite |R| over the window (== loop).
     thetas = np.empty(S)
     for i in range(S):
         col = absR[~nan[:, i], i]
-        thetas[i] = np.median(col) if col.size else np.nan
+        thetas[i] = np.quantile(col, theta_q) if col.size else np.nan
     with np.errstate(invalid="ignore"):
         large = absR >= thetas[None, :]                    # NaN -> False -> small
 
@@ -311,6 +316,46 @@ def _read_indicator(path):
     if path.endswith(".parquet"):
         return pd.read_parquet(path)
     return pd.read_csv(path)
+
+
+# --------------------------------------------------------------------------
+# Named crisis taxonomy -- a CROSS-CRISIS OVERLAY, *not* the binary labeler.
+# --------------------------------------------------------------------------
+DEFAULT_CRISES_CSV = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config", "crises.csv")
+
+
+def load_crisis_taxonomy(path=None):
+    """Load the named crisis sub-periods (config/crises.csv) as a tidy DataFrame
+    with parsed Timestamp `start`/`end` columns.
+
+    This is a shared overlay for cross-crisis comparison (financial/food/energy/
+    mixed). It is deliberately SEPARATE from `load_crisis_labels`: the binary
+    crisis/calm driver stays VIX/NBER-based; do NOT wire this taxonomy into it.
+    """
+    path = path or DEFAULT_CRISES_CSV
+    if not os.path.exists(path):
+        log.warning(f"load_crisis_taxonomy: '{path}' not found; returning empty.")
+        return pd.DataFrame(columns=["name", "start", "end", "type", "notes"])
+    tax = pd.read_csv(path)
+    tax["start"] = pd.to_datetime(tax["start"])
+    tax["end"] = pd.to_datetime(tax["end"])
+    return tax
+
+
+def tag_windows_with_crises(window_ids, win_bounds, taxonomy=None):
+    """Overlay: map each window_id -> list of named crises it overlaps (may be
+    empty, or several). For cross-crisis comparison only; does not affect the
+    binary label. A food crisis that overlaps NO NBER/VIX-stressed window (so it
+    is 'calm' under the binary labeler) is itself an important mismatch to flag."""
+    tax = taxonomy if taxonomy is not None else load_crisis_taxonomy()
+    out = {}
+    for wid in window_ids:
+        ws, we = pd.Timestamp(win_bounds[wid][0]), pd.Timestamp(win_bounds[wid][1])
+        hits = [r["name"] for _, r in tax.iterrows()
+                if not (we < r["start"] or ws > r["end"])]
+        out[wid] = hits
+    return out
 
 
 def _label_by_spans(window_ids, win_bounds, spans):
@@ -810,9 +855,22 @@ def sector_stratified_rates(pair_window_stats, sector_map):
 # ==========================================================================
 # MAIN
 # ==========================================================================
+def _iter_window_panels(elig, ret, window_ids, win_bounds):
+    """Yield (wid, win_start, win_end, permnos, ret_wide) per window. Centralizes
+    the per-window slice+pivot so the analyzer and the threshold sweep share it."""
+    for wid in window_ids:
+        ws, we = win_bounds[wid]
+        permnos = elig.loc[elig.window_id == wid, "permno"].tolist()
+        sub = ret[(ret.permno.isin(permnos)) & (ret.date >= ws) & (ret.date <= we)]
+        if sub.empty:
+            continue
+        ret_wide = sub.pivot_table(index="date", columns="permno", values="ret")
+        yield wid, ws, we, permnos, ret_wide
+
+
 def analyze(data_dir, out_path, n_min, sample=None, crisis_source=None,
             crisis_threshold=None, run_null=False, null_out=None,
-            null_max_pairs=2000, seed=0):
+            null_max_pairs=2000, seed=0, theta_q=0.5):
     d = load_data(data_dir)
     elig, ret = d["window_eligibility"], d["daily_returns"]
     window_ids = sorted(elig.window_id.unique())
@@ -824,16 +882,11 @@ def analyze(data_dir, out_path, n_min, sample=None, crisis_source=None,
                   for wid, g in elig.groupby("window_id")}
     labels = load_crisis_labels(window_ids, win_bounds, source=crisis_source,
                                 threshold=crisis_threshold)
+    log.info(f"theta quantile = {theta_q} (regime 0 = |R| >= per-stock q{theta_q} of |R|)")
 
     all_rows = []
-    for wid in window_ids:
-        ws, we = win_bounds[wid]
-        permnos = elig.loc[elig.window_id == wid, "permno"].tolist()
-        sub = ret[(ret.permno.isin(permnos)) & (ret.date >= ws) & (ret.date <= we)]
-        if sub.empty:
-            continue
-        ret_wide = sub.pivot_table(index="date", columns="permno", values="ret")
-        rows = run_window(wid, ws, we, permnos, ret_wide, n_min)
+    for wid, ws, we, permnos, ret_wide in _iter_window_panels(elig, ret, window_ids, win_bounds):
+        rows = run_window(wid, ws, we, permnos, ret_wide, n_min, theta_q=theta_q)
         for r in rows:
             r["regime"] = labels.get(wid, "calm")
         all_rows.extend(rows)
@@ -861,6 +914,82 @@ def analyze(data_dir, out_path, n_min, sample=None, crisis_source=None,
         except Exception:                              # noqa: BLE001
             null_out = null_out.replace(".parquet", ".csv"); null_df.to_csv(null_out, index=False)
         log.info(f"wrote {len(null_df):,} classical-null rows -> {null_out}")
+    return df
+
+
+# ==========================================================================
+# STEP 2 -- PERCENTILE-THRESHOLD ROBUSTNESS SWEEP
+# ==========================================================================
+def sweep_thresholds(data_dir, quantiles=(0.5, 0.75, 0.90, 0.95), n_min=10,
+                     crisis_source=None, crisis_threshold=None, sample=None,
+                     relaxed_n_min=3, relaxed_quantiles=(0.90, 0.95)):
+    """Sweep the magnitude-context threshold theta over `quantiles` and report the
+    deflation (naive s_odd>2 vs CbD ctx>0) by regime at each theta. Tallies are
+    accumulated per-window (never materializing all pair-windows), so this scales.
+
+    Strict headline: N_min held at `n_min` (= the spec's 10). A SMALL-SAMPLE
+    DIAGNOSTIC at the high quantiles relaxes N_min to `relaxed_n_min` purely to
+    show that any ctx>0 surfacing there is finite-N noise, not hidden contextuality
+    -- it is a diagnostic, not a result. At high theta the large-move regime gets
+    rare, so the four-cell CHSH structure loses support and the valid denominator
+    collapses: that is the method's well-posedness boundary, reported as such.
+
+    Returns one row per (theta_q, regime) with strict + relaxed rates and counts.
+    """
+    from collections import defaultdict
+    d = load_data(data_dir)
+    elig, ret = d["window_eligibility"], d["daily_returns"]
+    window_ids = sorted(elig.window_id.unique())
+    if sample:
+        window_ids = window_ids[:sample]
+    win_bounds = {wid: (g.win_start.iloc[0], g.win_end.iloc[0])
+                  for wid, g in elig.groupby("window_id")}
+    labels = load_crisis_labels(window_ids, win_bounds, source=crisis_source,
+                                threshold=crisis_threshold)
+    base_nmin = min(n_min, relaxed_n_min)
+    # tally[(q, regime)] = [strict_valid, strict_naive, strict_cbd,
+    #                       relaxed_valid, relaxed_naive, relaxed_cbd]
+    tally = defaultdict(lambda: np.zeros(6))
+    log.info(f"threshold sweep over quantiles {tuple(quantiles)} "
+             f"(strict N_min={n_min}; relaxed diagnostic N_min={relaxed_n_min} "
+             f"at q in {tuple(relaxed_quantiles)})")
+    for wid, ws, we, permnos, ret_wide in _iter_window_panels(elig, ret, window_ids, win_bounds):
+        reg = labels.get(wid, "calm")
+        for q in quantiles:
+            rows = run_window(wid, ws, we, permnos, ret_wide, base_nmin, theta_q=q)
+            t = tally[(float(q), reg)]
+            for r in rows:
+                nmin = min(r["N00"], r["N01"], r["N10"], r["N11"])
+                if nmin < relaxed_n_min or np.isnan(r["s_odd"]):
+                    continue
+                t[3] += 1; t[4] += (r["s_odd"] > 2); t[5] += (r["ctx"] > 0)
+                if nmin >= n_min:
+                    t[0] += 1; t[1] += (r["s_odd"] > 2); t[2] += (r["ctx"] > 0)
+        log.info(f"  swept window {wid} ({reg})")
+
+    out = []
+    for (q, reg), t in sorted(tally.items()):
+        sv, rv = t[0], t[3]
+        out.append({
+            "theta_q": q, "regime": reg, "n_min": n_min, "relaxed_n_min": relaxed_n_min,
+            "n_valid": int(sv),
+            "naive_rate": (t[1] / sv) if sv else np.nan,
+            "cbd_rate": (t[2] / sv) if sv else np.nan,
+            "n_valid_relaxed": int(rv),
+            "naive_rate_relaxed": (t[4] / rv) if rv else np.nan,
+            "cbd_rate_relaxed": (t[5] / rv) if rv else np.nan,
+            "is_relaxed_diag_q": bool(any(np.isclose(q, rq) for rq in relaxed_quantiles)),
+        })
+    df = pd.DataFrame(out)
+    for _, r in df.iterrows():
+        log.info(f"  theta_q={r.theta_q:.2f} {r.regime:>6}: "
+                 f"naive(s_odd>2)={r.naive_rate:.2%}, CbD(ctx>0)={r.cbd_rate:.2%}, "
+                 f"N_valid={r.n_valid:,}"
+                 + (f"  [relaxed N_min={relaxed_n_min}: CbD={r.cbd_rate_relaxed:.2%}, "
+                    f"N={r.n_valid_relaxed:,}]" if r.is_relaxed_diag_q else ""))
+        if r.cbd_rate > 0.01:
+            log.warning(f"  !! theta_q={r.theta_q:.2f} {r.regime}: CbD rate "
+                        f"{r.cbd_rate:.2%} > 1% -- INSPECT (a result, not a bug).")
     return df
 
 
@@ -910,6 +1039,43 @@ def _test_pipeline_smoke():
     assert all(set(("s_odd", "delta", "ctx", "valid")) <= set(r) for r in rows)
 
 
+def _test_theta_quantile():
+    """window_threshold honors q; higher q shrinks the large-move regime (more
+    days classified small, fewer large), and analyze/run_window thread it through."""
+    x = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0])
+    assert np.isclose(window_threshold(x, 0.5), np.median(x))
+    assert np.isclose(window_threshold(x, 0.9), np.quantile(x, 0.9))
+    # higher theta_q -> stricter 'large' cutoff -> fewer regime-0 (large) days
+    n_large_med = int((assign_regime(x, window_threshold(x, 0.5)) == 0).sum())
+    n_large_hi = int((assign_regime(x, window_threshold(x, 0.9)) == 0).sum())
+    assert n_large_hi < n_large_med
+
+
+def _test_threshold_sweep():
+    """sweep_thresholds returns the expected schema and strict<=relaxed valid counts."""
+    import tempfile
+    rng = np.random.default_rng(5)
+    dates = pd.bdate_range("2008-01-02", periods=80)
+    permnos = [11, 22, 33, 44]
+    recs = [(p, d, float(rng.normal(0, 0.02))) for p in permnos for d in dates]
+    ret = pd.DataFrame(recs, columns=["permno", "date", "ret"])
+    memb = pd.DataFrame({"permno": permnos, "mbrstartdt": pd.Timestamp("2000-01-01"),
+                         "mbrenddt": pd.Timestamp("2025-12-31")})
+    cal = pd.DataFrame({"date": dates})
+    elig = pd.DataFrame([(0, dates[0], dates[-1], p) for p in permnos],
+                        columns=["window_id", "win_start", "win_end", "permno"])
+    with tempfile.TemporaryDirectory() as tmp:
+        for nm, df in (("membership", memb), ("daily_returns", ret),
+                       ("trading_calendar", cal), ("window_eligibility", elig)):
+            df.to_parquet(os.path.join(tmp, nm + ".parquet"), index=False)
+        sw = sweep_thresholds(tmp, quantiles=(0.5, 0.9), n_min=5, relaxed_n_min=2,
+                              relaxed_quantiles=(0.9,))
+    assert {"theta_q", "regime", "cbd_rate", "n_valid", "cbd_rate_relaxed",
+            "n_valid_relaxed", "is_relaxed_diag_q"} <= set(sw.columns)
+    assert (sw["n_valid_relaxed"] >= sw["n_valid"]).all()
+    assert sw["is_relaxed_diag_q"].any()
+
+
 def _close_nan(x, y, atol=1e-9):
     """True if both NaN, or finite and close."""
     if (x is None or (isinstance(x, float) and np.isnan(x))) and \
@@ -928,17 +1094,18 @@ def _test_vectorized_equivalence():
     R[5, 1] = np.nan; R[10, 2] = np.nan; R[:3, 4] = np.nan      # missing days
     R[12, 0] = 0.0; R[20, 3] = 0.0; R[33, 2] = 0.0             # exact-zero (sgn 0)
     ret_wide = pd.DataFrame(R, index=dates, columns=permnos)
-    loop = _run_window_loop(0, dates[0], dates[-1], permnos, ret_wide, n_min=5)
-    vec = run_window(0, dates[0], dates[-1], permnos, ret_wide, n_min=5)
-    assert len(loop) == len(vec) == 10                          # C(5,2)
     int_keys = ("permno_a", "permno_b", "N00", "N01", "N10", "N11", "valid")
     flt_keys = ("E00", "E01", "E10", "E11", "a00", "a01", "a10", "a11",
                 "b00", "b01", "b10", "b11", "s_odd", "delta", "ctx")
-    for L, V in zip(loop, vec):
-        for k in int_keys:
-            assert L[k] == V[k], (k, L[k], V[k])
-        for k in flt_keys:
-            assert _close_nan(L[k], V[k]), (k, L[k], V[k])
+    for tq in (0.5, 0.75):                                      # default + a swept q
+        loop = _run_window_loop(0, dates[0], dates[-1], permnos, ret_wide, 5, theta_q=tq)
+        vec = run_window(0, dates[0], dates[-1], permnos, ret_wide, 5, theta_q=tq)
+        assert len(loop) == len(vec) == 10                      # C(5,2)
+        for L, V in zip(loop, vec):
+            for k in int_keys:
+                assert L[k] == V[k], (tq, k, L[k], V[k])
+            for k in flt_keys:
+                assert _close_nan(L[k], V[k]), (tq, k, L[k], V[k])
 
 
 def _test_crisis_labels():
@@ -966,6 +1133,23 @@ def _test_crisis_labels():
         spath = os.path.join(tmp, "rec.csv")
         pd.DataFrame({"start": ["2008-01-01"], "end": ["2009-06-30"]}).to_csv(spath, index=False)
         assert load_crisis_labels(wids, wb, source=spath)[1] == "crisis"
+
+
+def _test_crisis_taxonomy():
+    """The named taxonomy loads, parses dates, and overlays windows WITHOUT
+    touching the binary labeler. A 2008-food window overlaps named crises yet the
+    NBER binary label is independent."""
+    tax = load_crisis_taxonomy()
+    assert len(tax) >= 10, len(tax)
+    assert {"name", "start", "end", "type"} <= set(tax.columns)
+    assert tax["start"].notna().all() and tax["end"].notna().all()
+    wb = {0: (pd.Timestamp("2008-03-01"), pd.Timestamp("2008-05-31")),   # GFC + food
+          1: (pd.Timestamp("2003-01-01"), pd.Timestamp("2003-03-31"))}   # quiet
+    tags = tag_windows_with_crises([0, 1], wb, taxonomy=tax)
+    assert any("Financial" in n or "food" in n.lower() for n in tags[0]), tags[0]
+    assert tags[1] == [], tags[1]
+    # overlay must not change the binary labeler
+    assert load_crisis_labels([0, 1], wb, source=None) == {0: "calm", 1: "calm"}
 
 
 def _test_classical_generator_reproduces_box():
@@ -1050,7 +1234,8 @@ def _test_controls():
 
 
 _TESTS = (_test_handchecked, _test_postselection, _test_anchors, _test_pipeline_smoke,
-          _test_vectorized_equivalence, _test_crisis_labels,
+          _test_theta_quantile, _test_threshold_sweep,
+          _test_vectorized_equivalence, _test_crisis_labels, _test_crisis_taxonomy,
           _test_classical_generator_reproduces_box, _test_classical_null_runs,
           _test_exogenous_contrast, _test_controls)
 
@@ -1077,6 +1262,14 @@ def parse_args():
     ap.add_argument("--null-out", default=None, help="path for classical-null parquet")
     ap.add_argument("--null-max-pairs", type=int, default=2000,
                     help="cap on simulated pairs for the null (distribution, not all pairs)")
+    ap.add_argument("--theta-quantile", type=float, default=0.5,
+                    help="per-stock |R| quantile for the large/small regime split (spec default 0.5)")
+    ap.add_argument("--sweep", default=None,
+                    help="run the theta robustness sweep over a comma list of quantiles "
+                         "(e.g. '0.5,0.75,0.9,0.95') -> writes threshold_sweep.parquet and exits")
+    ap.add_argument("--sweep-out", default=None, help="path for the threshold-sweep parquet")
+    ap.add_argument("--relaxed-n-min", type=int, default=3,
+                    help="small-sample diagnostic N_min at high-theta sweep points")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--test", action="store_true", help="run unit tests and exit")
     return ap.parse_args()
@@ -1086,9 +1279,22 @@ if __name__ == "__main__":
     args = parse_args()
     if args.test:
         run_tests()
+    elif args.sweep:
+        quantiles = tuple(float(q) for q in args.sweep.split(","))
+        relaxed = tuple(q for q in quantiles if q >= 0.90)
+        sw = sweep_thresholds(args.data_dir, quantiles=quantiles, n_min=args.n_min,
+                              crisis_source=args.crisis_source,
+                              crisis_threshold=args.crisis_threshold, sample=args.sample,
+                              relaxed_n_min=args.relaxed_n_min, relaxed_quantiles=relaxed)
+        sweep_out = args.sweep_out or os.path.join(args.data_dir, "threshold_sweep.parquet")
+        try:
+            sw.to_parquet(sweep_out, index=False)
+        except Exception:                                  # noqa: BLE001
+            sweep_out = sweep_out.replace(".parquet", ".csv"); sw.to_csv(sweep_out, index=False)
+        log.info(f"wrote threshold sweep -> {sweep_out}")
     else:
         analyze(args.data_dir, args.out, args.n_min,
                 sample=args.sample, crisis_source=args.crisis_source,
                 crisis_threshold=args.crisis_threshold, run_null=args.null,
                 null_out=args.null_out, null_max_pairs=args.null_max_pairs,
-                seed=args.seed)
+                seed=args.seed, theta_q=args.theta_quantile)
