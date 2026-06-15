@@ -1207,29 +1207,59 @@ def sweep_thresholds(data_dir, quantiles=(0.25, 0.40, 0.42, 0.45, 0.48, 0.50, 0.
     return df
 
 
+def _pooled_from_row(r):
+    """N-weighted mean sign-correlation across the four CHSH cells for one
+    run_window row (mirrors networks.pooled_weight; kept here to avoid importing
+    networks, which would be circular)."""
+    num = (r["E00"] * r["N00"] + r["E01"] * r["N01"]
+           + r["E10"] * r["N10"] + r["E11"] * r["N11"])
+    den = r["N00"] + r["N01"] + r["N10"] + r["N11"]
+    return (num / den) if den else np.nan
+
+
+# Edge weights covered by the split-half reliability (R1). 's_odd' kept first so the
+# legacy 'reliability_sb' column (s_odd) stays backward-compatible for networks.py.
+RELIABILITY_WEIGHTS = ("s_odd", "e00", "pooled")
+
+
+def _row_weights(r):
+    """The three edge weights for one valid run_window row."""
+    return {"s_odd": r["s_odd"], "e00": r["E00"], "pooled": _pooled_from_row(r)}
+
+
 def s_odd_split_half_reliability(elig, ret, *, n_min=10, theta_q=0.5, sample=None,
-                                 seed=0, half_min_cell=2):
-    """Per-window s_odd REGIME-PRESERVING split-half reliability.
+                                 seed=0, half_min_cell=2, emit_edges_path=None):
+    """Per-window REGIME-PRESERVING split-half reliability for ALL THREE edge
+    weights (s_odd, E00, pooled correlation) -- the R1 checkpoint, since the network
+    findings (items 4-6) rest entirely on E00.
 
     The pitfall of a naive day-halving split is that recomputing theta on each half
     changes which days are large/small, so the two halves no longer measure the same
-    four-cell construct (the parallel-test assumption fails) and the reliability is
+    four-cell construct (the parallel-test assumption fails) and reliability is
     biased low. Here we instead FIX each stock's per-stock threshold at its FULL-
     window theta_q-quantile (`thresholds=` injected into run_window), assign regimes
     once, and split the days odd/even. Both halves then share identical per-day
     regime labels, so they are genuine parallel sub-tests; the half-length Pearson r
     is corrected to full length by Spearman-Brown (r_sb = 2r/(1+r)).
 
-    Reliability is computed over pairs that are valid at the full N_min in the full
-    window; a half contributes a pair's s_odd as long as each of its four cells has
-    >= `half_min_cell` days. Computed here (not in networks.py) because it needs the
-    per-DAY series only the driver has. Returns one row per window.
+    Reliability is computed over pairs valid at the full N_min in the full window; a
+    half contributes a pair as long as each of its four cells has >= `half_min_cell`
+    days. Computed here (not networks.py) because it needs the per-DAY series only the
+    driver has. Returns one row per window with `reliability_sb` (= s_odd, legacy)
+    plus `reliability_sb_{e00,pooled}` and the raw half-split r's.
+
+    If `emit_edges_path` is given, also writes a tidy per-window x half edge frame
+    (window_id, permno_a, permno_b, half, w_s_odd, w_e00, w_pooled over the full-valid
+    pairs) that networks.topology_reliability consumes for the edge-set Jaccard (R1b)
+    and the half-graph metric reliability (R1c).
     """
     window_ids = sorted(elig.window_id.unique())
     if sample:
         window_ids = window_ids[:sample]
     win_bounds = {wid: (g.win_start.iloc[0], g.win_end.iloc[0])
                   for wid, g in elig.groupby("window_id")}
+    if emit_edges_path is not None:                        # per-window shard directory
+        os.makedirs(emit_edges_path, exist_ok=True)
     rows = []
     for wid, ws, we, permnos, ret_wide in _iter_window_panels(elig, ret, window_ids, win_bounds):
         rw = ret_wide.sort_index()
@@ -1248,31 +1278,54 @@ def s_odd_split_half_reliability(elig, ret, *, n_min=10, theta_q=0.5, sample=Non
         if len(full_valid) < 3:
             continue
         ha, hb = rw.iloc[0::2], rw.iloc[1::2]              # parallel odd/even halves
-        sa = {(r["permno_a"], r["permno_b"]): r["s_odd"]
+        wa = {(r["permno_a"], r["permno_b"]): _row_weights(r)
               for r in run_window(wid, ws, we, cols, ha, half_min_cell,
                                   theta_q=theta_q, thresholds=thr)
               if r["valid"] and not np.isnan(r["s_odd"])}
-        sb = {(r["permno_a"], r["permno_b"]): r["s_odd"]
+        wb = {(r["permno_a"], r["permno_b"]): _row_weights(r)
               for r in run_window(wid, ws, we, cols, hb, half_min_cell,
                                   theta_q=theta_q, thresholds=thr)
               if r["valid"] and not np.isnan(r["s_odd"])}
-        common = [k for k in full_valid if k in sa and k in sb]
+        common = [k for k in full_valid if k in wa and k in wb]
         if len(common) < 3:
             continue
-        va = np.array([sa[k] for k in common]); vb = np.array([sb[k] for k in common])
-        if va.std() == 0 or vb.std() == 0:
-            continue
-        r = float(np.corrcoef(va, vb)[0, 1])
-        r_sb = (2 * r / (1 + r)) if (1 + r) != 0 else np.nan
-        rows.append({"window_id": wid, "win_start": ws, "n_pairs": len(common),
-                     "reliability_halfsplit": r, "reliability_sb": r_sb})
-        log.info(f"  reliability window {wid}: r={r:.3f} (SB={r_sb:.3f}), "
-                 f"N_common={len(common):,}")
+        rec = {"window_id": wid, "win_start": ws, "n_pairs": len(common)}
+        first = True
+        for wt in RELIABILITY_WEIGHTS:
+            va = np.array([wa[k][wt] for k in common], dtype=float)
+            vb = np.array([wb[k][wt] for k in common], dtype=float)
+            ok = np.isfinite(va) & np.isfinite(vb)
+            if ok.sum() >= 3 and va[ok].std() > 0 and vb[ok].std() > 0:
+                r = float(np.corrcoef(va[ok], vb[ok])[0, 1])
+                r_sb = (2 * r / (1 + r)) if (1 + r) != 0 else np.nan
+            else:
+                r = r_sb = np.nan
+            tag = "" if first else f"_{wt}"                # legacy: s_odd unsuffixed
+            rec[f"reliability_halfsplit{tag if not first else ''}"] = r
+            rec[f"reliability_sb{tag if not first else ''}"] = r_sb
+            if first:
+                first = False
+        rows.append(rec)
+        if emit_edges_path is not None:
+            erows = [{"window_id": wid, "permno_a": pa, "permno_b": pb, "half": half,
+                      "w_s_odd": wmap[(pa, pb)]["s_odd"], "w_e00": wmap[(pa, pb)]["e00"],
+                      "w_pooled": wmap[(pa, pb)]["pooled"]}
+                     for half, wmap in (("a", wa), ("b", wb)) for (pa, pb) in common]
+            pd.DataFrame(erows).to_parquet(
+                os.path.join(emit_edges_path, f"shard_{int(wid):05d}.parquet"), index=False)
+        log.info(f"  reliability window {wid}: SB s_odd={rec['reliability_sb']:.3f} "
+                 f"E00={rec['reliability_sb_e00']:.3f} pooled={rec['reliability_sb_pooled']:.3f}"
+                 f" (N_common={len(common):,})")
     df = pd.DataFrame(rows)
     if len(df):
-        log.info(f"s_odd reliability (regime-preserving): mean half-split "
-                 f"r={df.reliability_halfsplit.mean():.3f}, mean Spearman-Brown "
-                 f"r={df.reliability_sb.mean():.3f}")
+        means = []
+        for wt in RELIABILITY_WEIGHTS:
+            col = "reliability_sb" if wt == "s_odd" else f"reliability_sb_{wt}"
+            means.append(f"{wt}={df[col].mean():.3f}")
+        log.info("split-half reliability (regime-preserving), mean Spearman-Brown r: "
+                 + ", ".join(means))
+    if emit_edges_path is not None:
+        log.info(f"  wrote split-half edge shards -> {emit_edges_path}/")
     return df
 
 
@@ -1754,9 +1807,11 @@ if __name__ == "__main__":
         log.info(f"wrote threshold sweep -> {sweep_out}")
     elif args.reliability:
         d = load_data(args.data_dir)
+        edges_out = os.path.join(args.data_dir, "split_half_edge_weights")
         rel = s_odd_split_half_reliability(
             d["window_eligibility"], d["daily_returns"], n_min=args.n_min,
-            theta_q=args.theta_quantile, sample=args.sample, seed=args.seed)
+            theta_q=args.theta_quantile, sample=args.sample, seed=args.seed,
+            emit_edges_path=edges_out)
         out = os.path.join(args.data_dir, "s_odd_reliability.parquet")
         try:
             rel.to_parquet(out, index=False)
