@@ -879,7 +879,7 @@ def plot_network_metrics_over_time(metrics: pd.DataFrame, metric: str = "giant_f
     ax.set_title(f"{dict(_METRICS).get(metric, metric)} over time (crisis shaded)")
     ax.legend(fontsize=9)
     _caption(fig, "E00 (canonical tail coupling) solid; pooled baseline dashed; s_odd "
-                  "control dotted. Shaded spans = crisis windows (VIX/NBER label).")
+                  "control dotted. Shaded spans = crisis windows (NBER recessions).")
     fig.tight_layout(rect=(0, 0.03, 1, 1))
     return fig
 
@@ -925,7 +925,7 @@ def plot_all_metrics_over_time(metrics: pd.DataFrame, value_suffix: str = "") ->
                  else "raw metrics")
     fig.suptitle(f"Network topology over time ({kind_note})", fontweight="bold")
     _caption(fig, "E00 (canonical) solid, pooled (baseline) dashed, s_odd (control) "
-                  "dotted; shaded = crisis windows (VIX/NBER).")
+                  "dotted; shaded = crisis windows (NBER recessions).")
     fig.tight_layout(rect=(0, 0.03, 1, 0.96))
     return fig
 
@@ -958,7 +958,7 @@ def plot_metrics_by_crisis_type(metrics: pd.DataFrame, metric: str = "modularity
     ax.set_title(f"{dict(_METRICS).get(metric, metric)} by crisis-taxonomy type")
     ax.legend(title="graph", fontsize=9)
     _caption(fig, "Density-matched graphs; windows exploded across overlapping crisis "
-                  "types (config/crises.csv overlay, NOT the binary VIX/NBER label).")
+                  "types (config/crises.csv overlay, NOT the binary NBER crisis label).")
     fig.tight_layout(rect=(0, 0.03, 1, 1))
     return fig
 

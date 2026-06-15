@@ -435,3 +435,13 @@ from the **source data** (not eyeballed), and the manuscript result it maps to.
 sector column. (2) `fig_p`'s annotated s_odd reliability (0.045) predates the R1 recomputation
 (current s_odd edge SB r = 0.163, fig_q); the gate verdict rests on d = real−null R² = +0.089
 [CI +0.070, +0.105], which is unaffected.
+
+**Crisis-label note (resolved):** the binary crisis/calm driver for this run is **built-in NBER
+recession spans** (a 60-td window is crisis iff `[win_start, win_end]` overlaps an NBER span;
+`cbd_analysis.NBER_RECESSIONS` = 1990-07/1991-03, 2001-03/2001-11, 2007-12/2009-06, 2020-02/2020-04).
+Verified against the shards: 100% of windows satisfy `(overlaps NBER) == (regime==crisis)`, 0
+crisis windows fall outside NBER spans, and the 50 crisis windows lie only in 1990–91 (11), 2000–01
+(12), 2007–09 (22), 2019–20 (5). VIX was **not** used (no VIX file on disk; a VIX threshold would
+also flag 2011/2015–16/2018/2022, which are absent). The figure footers, which previously carried a
+generic "VIX/NBER" literal, were corrected to read **"NBER recessions"** and figs r/m/o/t/u
+re-rendered.

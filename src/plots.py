@@ -495,7 +495,7 @@ def plot_sp500_index(index_df: pd.DataFrame,
     ax.legend(loc="upper left")
     fig.autofmt_xdate()
     _caption(fig, f"CRSP daily S&P 500 (spindx); N={len(d):,} trading days. "
-                  "Shaded = crisis windows (VIX/NBER).")
+                  "Shaded = crisis windows (NBER recessions).")
     fig.tight_layout(rect=(0, 0.03, 1, 1))
     return fig
 
