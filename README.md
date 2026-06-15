@@ -164,7 +164,12 @@ These hardening steps gate the network findings and add recognizable context.
 - **R3 — window-level inference** (runs inside `--robustness`). Crisis-vs-calm and
   food-vs-financial permutation tests at the **window level** (windows as the unit) on
   the excess metrics; pair-level p-values are intentionally dropped (with ~5·10⁷ pairs
-  they are meaningless). Writes `window_level_inference.parquet`.
+  they are meaningless). Writes `window_level_inference.parquet`. Full-span E00 result:
+  crisis windows fragment (giant-frac excess p=0.0015) and de-cluster (clustering excess
+  p=0.0002), but the *modularity* crisis effect washes out after the degree-null control
+  (p=0.20) — it was largely a composition effect. The **food-vs-financial** modularity
+  gap survives the strongest controls (excess modularity p=0.008, clustering p=0.021):
+  food windows are structurally distinct beyond generic-crisis effects.
 - **R4 — window-length sensitivity** (`rebuild_windows.py --window-days 120`). Re-derives
   `window_eligibility` at 120 td from the on-disk panel (no WRDS re-pull; reuses the
   extractor's `build_windows`/`compute_eligibility`) into a sibling data dir with the
