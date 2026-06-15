@@ -267,6 +267,317 @@ def _attach_taxonomy(metrics: pd.DataFrame, win_bounds: dict,
 
 
 # ==========================================================================
+# R1 TOPOLOGY RELIABILITY  (edge-set Jaccard + half-graph metric reliability)
+# ==========================================================================
+RELIABILITY_METRICS = ("modularity", "giant_frac", "avg_clustering")
+
+
+def _edge_set(G: nx.Graph) -> set:
+    """Undirected edge set as frozensets (order-independent)."""
+    return {frozenset((int(a), int(b))) for a, b in G.edges()}
+
+
+def topology_reliability(edges_path: str, edge_quantile: float = 0.05,
+                         kinds=("e00", "pooled", "s_odd")) -> pd.DataFrame:
+    """R1b + R1c. Reads the per-window x half edge frame emitted by
+    cbd_analysis.s_odd_split_half_reliability(emit_edges_path=...) and, per window,
+    for each graph kind:
+      * builds the density-matched (top-`edge_quantile`) graph on EACH day-half over
+        the common pair set, and reports the Jaccard overlap of the two top-q edge
+        SETS (R1b: edge-set stability), and
+      * the modularity / giant-frac / clustering of each half graph (R1c inputs).
+    One row per (window, kind). The across-window half-1-vs-half-2 metric correlation
+    (the decisive R1c number) is computed by `reliability_summary`.
+    """
+    def _iter_edge_windows(path):
+        """Yield one per-window edge frame, streaming a shard directory or grouping
+        a monolithic file (so the full-span frame is never held in memory)."""
+        if os.path.isdir(path):
+            for sh in sorted(glob.glob(os.path.join(path, "*.parquet"))):
+                d = pd.read_parquet(sh)
+                for _, g in d.groupby("window_id"):
+                    yield g
+            return
+        d = _read_optional(path)
+        if d is None or d.empty:
+            return
+        for _, g in d.groupby("window_id"):
+            yield g
+
+    wcol = {"e00": "w_e00", "pooled": "w_pooled", "s_odd": "w_s_odd"}
+    rows = []
+    for g in _iter_edge_windows(edges_path):
+        wid = int(g["window_id"].iloc[0])
+        ga, gb = g[g["half"] == "a"], g[g["half"] == "b"]
+        key = ["permno_a", "permno_b"]
+        common = ga.merge(gb[key], on=key)               # pairs present in both halves
+        if len(common) < 10:
+            continue
+        a = ga.merge(common[key], on=key)
+        b = gb.merge(common[key], on=key)
+        for kind in kinds:
+            wc = wcol[kind]
+            # rename to the build_graph weight column so we can reuse it as-is
+            da = a.rename(columns={wc: _WEIGHT_COL[kind]})
+            db = b.rename(columns={wc: _WEIGHT_COL[kind]})
+            Ga = build_graph(da, kind, edge_quantile=edge_quantile)
+            Gb = build_graph(db, kind, edge_quantile=edge_quantile)
+            ea, eb = _edge_set(Ga), _edge_set(Gb)
+            union = ea | eb
+            jacc = len(ea & eb) / len(union) if union else np.nan
+            ma, mb = graph_metrics(Ga), graph_metrics(Gb)
+            rec = {"window_id": int(wid), "graph": kind, "n_common": len(common),
+                   "jaccard_topq": jacc}
+            for mt in RELIABILITY_METRICS:
+                rec[f"{mt}_a"] = ma[mt]
+                rec[f"{mt}_b"] = mb[mt]
+            rows.append(rec)
+        log.info(f"  topo-reliability window {wid}: "
+                 + ", ".join(f"{k} J={r['jaccard_topq']:.2f}"
+                             for k, r in [(kk, next(x for x in rows[-3:] if x['graph'] == kk))
+                                          for kk in kinds] if r))
+    return pd.DataFrame(rows)
+
+
+def reliability_summary(edge_rel: pd.DataFrame,
+                        weight_rel: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """Collapse the per-window topology reliability into one row per graph kind:
+    mean top-q edge Jaccard (R1b) and the across-window half-1-vs-half-2 correlation
+    of each metric (R1c). If `weight_rel` (the cbd_analysis edge-weight SB-r table) is
+    given, its mean SB r per kind (R1a) is merged in for the single checkpoint table.
+    """
+    if edge_rel is None or edge_rel.empty:
+        return pd.DataFrame()
+    sb_col = {"s_odd": "reliability_sb", "e00": "reliability_sb_e00",
+              "pooled": "reliability_sb_pooled"}
+    out = []
+    for kind, g in edge_rel.groupby("graph"):
+        rec = {"graph": kind, "n_windows": len(g),
+               "mean_jaccard_topq": float(g["jaccard_topq"].mean())}
+        for mt in RELIABILITY_METRICS:
+            a, b = g[f"{mt}_a"].to_numpy(float), g[f"{mt}_b"].to_numpy(float)
+            ok = np.isfinite(a) & np.isfinite(b)
+            rec[f"{mt}_halfcorr"] = (float(np.corrcoef(a[ok], b[ok])[0, 1])
+                                     if ok.sum() >= 3 and a[ok].std() > 0
+                                     and b[ok].std() > 0 else np.nan)
+        if weight_rel is not None and not weight_rel.empty and kind in sb_col \
+                and sb_col[kind] in weight_rel.columns:
+            rec["mean_edge_sb_r"] = float(weight_rel[sb_col[kind]].mean())
+        out.append(rec)
+    df = pd.DataFrame(out)
+    log.info("R1 RELIABILITY CHECKPOINT (per graph kind):")
+    for _, r in df.iterrows():
+        sb = r.get("mean_edge_sb_r", np.nan)
+        log.info(f"  {r['graph']:>6}: edge SB r={sb:.3f} | top-q Jaccard="
+                 f"{r['mean_jaccard_topq']:.3f} | half-corr "
+                 f"mod={r['modularity_halfcorr']:.3f} giant={r['giant_frac_halfcorr']:.3f} "
+                 f"clust={r['avg_clustering_halfcorr']:.3f}")
+    return df
+
+
+def plot_topology_reliability(summary: pd.DataFrame, e00_cleared: bool) -> Figure:
+    """R1 checkpoint exhibit: edge SB r, top-q Jaccard, and half-to-half metric
+    correlations per graph kind, with the noise-floor guides drawn."""
+    name = "fig_q_topology_reliability"
+    if _missing(summary, ("graph", "mean_jaccard_topq"), name):
+        return _placeholder("Topology reliability", "summary missing")
+    order = [k for k in ("pooled", "e00", "s_odd") if k in set(summary["graph"])]
+    s = summary.set_index("graph").loc[order]
+    series = [("edge SB r", s.get("mean_edge_sb_r")),
+              ("top-q Jaccard", s["mean_jaccard_topq"]),
+              ("modularity half-corr", s["modularity_halfcorr"]),
+              ("giant-frac half-corr", s["giant_frac_halfcorr"])]
+    series = [(lab, v) for lab, v in series if v is not None]
+    x = np.arange(len(order)); w = 0.8 / len(series)
+    fig, ax = plt.subplots()
+    palette = [OKABE["blue"], OKABE["orange"], OKABE["green"], OKABE["vermillion"]]
+    for k, (lab, v) in enumerate(series):
+        ax.bar(x + (k - (len(series) - 1) / 2) * w, np.asarray(v, float), w,
+               label=lab, color=palette[k % len(palette)])
+    ax.axhline(0.3, color=OKABE["black"], ls="--", lw=1.0, label="SB r=0.3 bar")
+    ax.axhline(0.2, color=OKABE["black"], ls=":", lw=1.0, label="Jaccard=0.2 bar")
+    ax.set_xticks(x)
+    ax.set_xticklabels([GRAPH_LABELS.get(k, k) for k in order])
+    ax.set_ylabel("reliability (r / Jaccard)")
+    verdict = "E00 CLEARS the bar" if e00_cleared else "E00 NOISE-DOMINATED (deflation-only)"
+    ax.set_title(f"R1 reliability checkpoint -- {verdict}")
+    ax.legend(loc="upper right", fontsize=8, ncol=2)
+    _caption(fig, "Regime-preserving odd/even split. Bars below the dashed/dotted "
+                  "guides indicate selection-on-noise.")
+    fig.tight_layout(rect=(0, 0.03, 1, 1))
+    return fig
+
+
+# ==========================================================================
+# R2  CONFIGURATION-MODEL NULL  (N/era-controlled excess-over-null metrics)
+# ==========================================================================
+def _config_null_metrics(G: nx.Graph, n_rewire: int, seed: int) -> dict:
+    """Observed vs degree-preserving (double-edge-swap) null for one graph.
+    Returns {metric: (obs, null_mean, null_sd)} for modularity/giant-frac/clustering.
+    Edge density is invariant under degree-preserving rewiring, so it is omitted."""
+    obs = graph_metrics(G)
+    out = {m: (obs[m], np.nan, np.nan) for m in RELIABILITY_METRICS}
+    m_edges = G.number_of_edges()
+    if m_edges < 2:
+        return out
+    rng = np.random.default_rng(seed)
+    samples = {m: [] for m in RELIABILITY_METRICS}
+    for _ in range(n_rewire):
+        H = G.copy()
+        try:
+            nx.double_edge_swap(H, nswap=m_edges, max_tries=10 * m_edges,
+                                seed=int(rng.integers(1_000_000_000)))
+        except Exception:                                  # noqa: BLE001
+            continue
+        md = graph_metrics(H)
+        for m in RELIABILITY_METRICS:
+            samples[m].append(md[m])
+    for m in RELIABILITY_METRICS:
+        arr = np.array([x for x in samples[m] if np.isfinite(x)], dtype=float)
+        out[m] = (obs[m], float(arr.mean()) if len(arr) else np.nan,
+                  float(arr.std(ddof=1)) if len(arr) > 1 else np.nan)
+    return out
+
+
+def config_model_excess(stats_path: str, edge_quantile: float = 0.05,
+                        n_rewire: int = 20, seed: int = 0,
+                        taxonomy: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """R2. Per window x graph kind, report each topology metric as excess over a
+    degree-preserving configuration-model null (obs - null_mean), plus a z-score
+    (obs - null_mean)/null_sd. This controls for the node-count / composition shifts
+    that confound modularity & giant-frac across eras (food/crisis windows cluster in
+    specific eras with different name counts). One row per (window, graph)."""
+    rows, win_bounds = [], {}
+    for g in iter_window_stats(stats_path):
+        if g.empty:
+            continue
+        wid = int(g["window_id"].iloc[0]); ws = g["win_start"].iloc[0]
+        win_bounds[wid] = (ws, g["win_end"].iloc[0] if "win_end" in g.columns else ws)
+        regime = g["regime"].iloc[0] if "regime" in g.columns else "calm"
+        for kind in GRAPH_KINDS:
+            G = build_graph(g, kind, edge_quantile=edge_quantile)
+            cm = _config_null_metrics(G, n_rewire, seed + wid)
+            rec = {"window_id": wid, "win_start": ws, "regime": regime, "graph": kind}
+            for m, (obs, mu, sd) in cm.items():
+                rec[m] = obs
+                rec[f"{m}_null_mean"] = mu
+                rec[f"{m}_excess"] = obs - mu if np.isfinite(mu) else np.nan
+                rec[f"{m}_z"] = ((obs - mu) / sd) if (np.isfinite(mu) and sd and sd > 0) else np.nan
+            rows.append(rec)
+        log.info(f"  config-null window {wid} ({regime}) done")
+    df = pd.DataFrame(rows)
+    if len(df) and taxonomy is not None and len(taxonomy):
+        df = _attach_taxonomy(df, win_bounds, taxonomy)
+    return df
+
+
+# ==========================================================================
+# R3  WINDOW-LEVEL INFERENCE  (windows as the unit; pair-level p dropped)
+# ==========================================================================
+def _perm_diff(a: np.ndarray, b: np.ndarray, n_perm: int = 20000,
+               seed: int = 0) -> tuple:
+    """Two-sided permutation test of the mean difference (a - b). Returns
+    (diff, p, n_a, n_b)."""
+    rng = np.random.default_rng(seed)
+    a = np.asarray(a, float); b = np.asarray(b, float)
+    a = a[np.isfinite(a)]; b = b[np.isfinite(b)]
+    if len(a) < 2 or len(b) < 2:
+        return (np.nan, np.nan, len(a), len(b))
+    obs = a.mean() - b.mean()
+    pool = np.concatenate([a, b]); na = len(a); ge = 1
+    for _ in range(n_perm):
+        rng.shuffle(pool)
+        if abs(pool[:na].mean() - pool[na:].mean()) >= abs(obs):
+            ge += 1
+    return (float(obs), ge / (n_perm + 1), len(a), len(b))
+
+
+def window_level_inference(excess: pd.DataFrame, kind: str = "e00",
+                           metrics=("modularity", "giant_frac", "avg_clustering"),
+                           value_suffix: str = "_excess", n_perm: int = 20000,
+                           seed: int = 0) -> pd.DataFrame:
+    """R3. Crisis-vs-calm and food-vs-financial permutation tests at the WINDOW level
+    (windows as the unit, ~50 crisis vs ~379 calm; ~58 food vs ~114 financial), on the
+    excess-over-null metrics for `kind` (E00 by default). Pair-level p-values are
+    intentionally not produced -- with 5e7 pairs they are meaningless."""
+    if excess is None or excess.empty or "graph" not in excess.columns:
+        return pd.DataFrame()
+    d = excess[excess["graph"] == kind].copy()             # one row per window
+    rows = []
+    for m in metrics:
+        col = m + value_suffix
+        if col not in d.columns:
+            continue
+        cr = d[d["regime"] == "crisis"][col].to_numpy(float)
+        ca = d[d["regime"] == "calm"][col].to_numpy(float)
+        diff, p, na, nb = _perm_diff(cr, ca, n_perm, seed)
+        rows.append({"contrast": "crisis_vs_calm", "metric": m, "graph": kind,
+                     "mean_group1": float(np.nanmean(cr)) if len(cr) else np.nan,
+                     "mean_group2": float(np.nanmean(ca)) if len(ca) else np.nan,
+                     "n_group1": na, "n_group2": nb, "diff": diff, "perm_p": p})
+    if "crisis_types" in d.columns:
+        dt = d.assign(_t=d["crisis_types"].fillna("none").str.split(";"))
+        food = dt[dt["_t"].apply(lambda L: "food" in L)]
+        fin = dt[dt["_t"].apply(lambda L: "financial" in L)]
+        for m in metrics:
+            col = m + value_suffix
+            if col not in d.columns:
+                continue
+            diff, p, na, nb = _perm_diff(food[col].to_numpy(float),
+                                         fin[col].to_numpy(float), n_perm, seed)
+            rows.append({"contrast": "food_vs_financial", "metric": m, "graph": kind,
+                         "mean_group1": float(np.nanmean(food[col])) if len(food) else np.nan,
+                         "mean_group2": float(np.nanmean(fin[col])) if len(fin) else np.nan,
+                         "n_group1": na, "n_group2": nb, "diff": diff, "perm_p": p})
+    out = pd.DataFrame(rows)
+    if len(out):
+        log.info("R3 WINDOW-LEVEL INFERENCE (excess-over-null, E00):")
+        for _, r in out.iterrows():
+            log.info(f"  {r['contrast']:>18} {r['metric']:>14}: "
+                     f"diff={r['diff']:+.4f} (n={r['n_group1']} vs {r['n_group2']}) "
+                     f"perm_p={r['perm_p']:.4f}")
+    return out
+
+
+def robustness_report(data_dir: str, out_dir: str, edge_quantile: float = 0.05,
+                      n_rewire: int = 20, seed: int = 0,
+                      stats_file: Optional[str] = None) -> None:
+    """Run R2 (config-model excess) + R3 (window-level inference), write artifacts,
+    and render the excess-over-null small-multiples figure."""
+    set_style()
+    stats_path = stats_file or _resolve_stats(data_dir)
+    tax = _load_taxonomy_safe()
+    excess = config_model_excess(stats_path, edge_quantile=edge_quantile,
+                                 n_rewire=n_rewire, seed=seed, taxonomy=tax)
+    if excess.empty:
+        log.error("robustness_report: no windows; aborting.")
+        return
+    _save(excess, os.path.join(data_dir, "network_metrics_excess.parquet"))
+    wli = window_level_inference(excess, kind="e00")
+    _save(wli, os.path.join(data_dir, "window_level_inference.parquet"))
+    try:
+        fig = plot_all_metrics_over_time(excess, value_suffix="_excess")
+        save_figure(fig, out_dir, "fig_u_excess_metrics_over_time"); plt.close(fig)
+    except Exception as e:                                  # noqa: BLE001
+        log.warning(f"fig_u: failed to render ({e}); skipping.")
+
+
+def _resolve_stats(data_dir: str) -> str:
+    for cand in ("pair_window_stats", "pair_window_stats.parquet"):
+        p = os.path.join(data_dir, cand)
+        if os.path.isdir(p) or os.path.exists(p):
+            return p
+    return os.path.join(data_dir, "pair_window_stats")
+
+
+def _load_taxonomy_safe() -> Optional[pd.DataFrame]:
+    try:
+        return load_crisis_taxonomy()
+    except Exception:                                      # noqa: BLE001
+        return None
+
+
+# ==========================================================================
 # MR-QAP  (the "does s_odd earn its place" gate)
 # ==========================================================================
 def pair_matrix(df: pd.DataFrame, kind: str, nodes: list) -> np.ndarray:
@@ -573,6 +884,52 @@ def plot_network_metrics_over_time(metrics: pd.DataFrame, metric: str = "giant_f
     return fig
 
 
+def plot_all_metrics_over_time(metrics: pd.DataFrame, value_suffix: str = "") -> Figure:
+    """P1c. Small-multiples of ALL FOUR topology metrics over time, pooled (baseline)
+    + E00 (canonical), s_odd as control, crisis-shaded. Generalizes fig_m (giant-frac
+    only). With `value_suffix='_excess'` it plots the configuration-model
+    excess-over-null versions (R2) instead of the raw metrics."""
+    name = "fig_t_all_metrics_over_time"
+    base_cols = [m for m, _ in _METRICS]
+    cols = [c + value_suffix for c in base_cols]
+    if _missing(metrics, ("graph", "win_start"), name) or \
+            not any(c in metrics.columns for c in cols):
+        return _placeholder("All metrics over time", "network_metrics missing")
+    dens = metrics[metrics["graph"].isin(GRAPH_KINDS)].copy()
+    dens["win_start"] = pd.to_datetime(dens["win_start"])
+    reg_tbl = (dens[["window_id", "win_start", "regime"]].drop_duplicates("window_id")
+               .sort_values("win_start"))
+    palette = {"pooled": OKABE["grey"], "e00": OKABE["blue"], "s_odd": OKABE["vermillion"]}
+    styles = {"pooled": "--", "e00": "-", "s_odd": ":"}
+    fig, axes = plt.subplots(2, 2, figsize=(13, 8), sharex=True)
+    for ax, (mcol, mlab) in zip(axes.ravel(), _METRICS):
+        col = mcol + value_suffix
+        if col not in dens.columns:
+            ax.set_visible(False); continue
+        _shade_crisis(ax, reg_tbl)
+        for kind in GRAPH_KINDS:
+            dk = dens[dens["graph"] == kind].sort_values("win_start")
+            if dk.empty or col not in dk:
+                continue
+            ax.plot(dk["win_start"], dk[col], color=palette[kind],
+                    ls=styles.get(kind, "-"), lw=1.1, label=GRAPH_LABELS.get(kind, kind))
+        if value_suffix == "_excess":
+            ax.axhline(0, color=OKABE["black"], lw=0.8)
+        ax.set_title((mlab + (" (excess over config-null)" if value_suffix else "")))
+        ax.set_ylabel(mlab)
+    axes.ravel()[0].legend(fontsize=8, loc="best")
+    for ax in axes[-1]:
+        ax.set_xlabel("window start")
+    fig.autofmt_xdate()
+    kind_note = ("configuration-model excess-over-null" if value_suffix
+                 else "raw metrics")
+    fig.suptitle(f"Network topology over time ({kind_note})", fontweight="bold")
+    _caption(fig, "E00 (canonical) solid, pooled (baseline) dashed, s_odd (control) "
+                  "dotted; shaded = crisis windows (VIX/NBER).")
+    fig.tight_layout(rect=(0, 0.03, 1, 0.96))
+    return fig
+
+
 def plot_metrics_by_crisis_type(metrics: pd.DataFrame, metric: str = "modularity"
                                 ) -> Figure:
     """Step-5 cross-crisis breakdown: a density-matched metric for the E00 and
@@ -737,13 +1094,48 @@ def build_all(data_dir: str, out_dir: str, stats_file: Optional[str] = None,
         "fig_n_qap_hierarchy": lambda: plot_qap_hierarchy(qap),
         "fig_o_metrics_by_crisis_type": lambda: plot_metrics_by_crisis_type(metrics),
         "fig_p_gate_null_relative": lambda: plot_gate_null_relative(summary),
+        "fig_t_all_metrics_over_time": lambda: plot_all_metrics_over_time(metrics),
     }
+    excess = _read_optional(os.path.join(data_dir, "network_metrics_excess"))
+    if excess is not None and not excess.empty:
+        figs["fig_u_excess_metrics_over_time"] = \
+            lambda: plot_all_metrics_over_time(excess, value_suffix="_excess")
     for nm, fn in figs.items():
         try:
             fig = fn(); save_figure(fig, out_dir, nm); plt.close(fig)
         except Exception as e:                             # noqa: BLE001
             log.warning(f"{nm}: failed to render ({e}); skipping.")
     log.info(f"done -> {out_dir}")
+
+
+def topo_reliability_report(data_dir: str, out_dir: str, edge_quantile: float = 0.05,
+                            edges_file: Optional[str] = None) -> pd.DataFrame:
+    """R1 checkpoint driver: read the split-half edge frame + edge-weight SB-r table,
+    compute the topology reliability (Jaccard + half-graph metric correlation), write
+    artifacts, render fig (q), and return the per-kind summary."""
+    set_style()
+    edges = edges_file or os.path.join(data_dir, "split_half_edge_weights")
+    edge_rel = topology_reliability(edges, edge_quantile=edge_quantile)
+    if edge_rel.empty:
+        log.error("topo_reliability_report: no reliability rows; run "
+                  "`cbd_analysis.py --reliability` first to emit split_half_edge_weights.")
+        return pd.DataFrame()
+    _save(edge_rel, os.path.join(data_dir, "topology_reliability.parquet"))
+    weight_rel = _read_optional(os.path.join(data_dir, "s_odd_reliability"))
+    summary = reliability_summary(edge_rel, weight_rel)
+    _save(summary, os.path.join(data_dir, "reliability_checkpoint.parquet"))
+    e00 = summary[summary["graph"] == "e00"]
+    cleared = bool(len(e00) and (
+        (e00["mean_edge_sb_r"].iloc[0] if "mean_edge_sb_r" in e00 else 0) >= 0.3
+        or e00["mean_jaccard_topq"].iloc[0] >= 0.2
+        or e00["modularity_halfcorr"].iloc[0] >= 0.3))
+    try:
+        fig = plot_topology_reliability(summary, cleared)
+        save_figure(fig, out_dir, "fig_q_topology_reliability"); plt.close(fig)
+    except Exception as e:                                  # noqa: BLE001
+        log.warning(f"fig_q: failed to render ({e}); skipping.")
+    log.info(f"R1 VERDICT: E00 {'CLEARS' if cleared else 'FAILS'} the reliability bar.")
+    return summary
 
 
 def _read_optional(path: str) -> Optional[pd.DataFrame]:
@@ -848,13 +1240,45 @@ def run_tests() -> None:
         assert {"real_gate_r2", "null_gate_r2", "reliability_sb",
                 "diff_real_minus_null", "diff_ci_lo", "diff_ci_hi"} <= set(summ)
 
+        # R1 topology reliability (synthetic per-window x half edge frame)
+        erows = []
+        for wid in range(4):
+            gw = stats[stats.window_id == wid]
+            for half in ("a", "b"):
+                noise = np.random.default_rng(wid * 10 + (half == "b")).normal(
+                    0, 0.05, len(gw))
+                erows.append(pd.DataFrame({
+                    "window_id": wid, "permno_a": gw.permno_a.values,
+                    "permno_b": gw.permno_b.values, "half": half,
+                    "w_s_odd": gw.s_odd.values + noise,
+                    "w_e00": gw.E00.values + noise,
+                    "w_pooled": gw.E00.values * 0.8 + noise}))
+        epath = os.path.join(tmp, "split_half_edge_weights.parquet")
+        pd.concat(erows, ignore_index=True).to_parquet(epath, index=False)
+        erel = topology_reliability(epath, edge_quantile=0.1)
+        assert {"graph", "jaccard_topq", "modularity_a", "modularity_b"} <= set(erel.columns)
+        rsumm = reliability_summary(erel, rel.assign(reliability_sb_e00=0.6,
+                                                     reliability_sb_pooled=0.6))
+        assert {"graph", "mean_jaccard_topq", "modularity_halfcorr"} <= set(rsumm.columns)
+
+        # R2 configuration-model excess + R3 window-level inference
+        excess = config_model_excess(path, edge_quantile=0.1, n_rewire=5,
+                                     taxonomy=load_crisis_taxonomy())
+        assert {"graph", "modularity_excess", "modularity_z"} <= set(excess.columns)
+        wli = window_level_inference(excess, kind="e00", n_perm=200)
+        assert {"contrast", "metric", "perm_p", "n_group1"} <= set(wli.columns)
+        assert (wli["contrast"] == "crisis_vs_calm").any()
+
         # every figure returns a Figure
         for fig in (plot_network_metrics_crisis_calm(metrics),
                     plot_sodd_abs_amount(metrics),
                     plot_network_metrics_over_time(metrics),
+                    plot_all_metrics_over_time(metrics),
+                    plot_all_metrics_over_time(excess, value_suffix="_excess"),
                     plot_qap_hierarchy(qdf),
                     plot_metrics_by_crisis_type(metrics),
-                    plot_gate_null_relative(summ)):
+                    plot_gate_null_relative(summ),
+                    plot_topology_reliability(rsumm, True)):
             assert isinstance(fig, Figure)
             plt.close(fig)
 
@@ -892,6 +1316,15 @@ def parse_args():
     ap.add_argument("--gate-nodes", type=int, default=60,
                     help="first-N nodes per window for the MR-QAP gate (align with the "
                          "null-gate emission; 0 = all nodes)")
+    ap.add_argument("--topo-reliability", action="store_true",
+                    help="R1 checkpoint: read split_half_edge_weights + s_odd_reliability, "
+                         "report edge-set Jaccard + half-graph metric reliability and exit")
+    ap.add_argument("--robustness", action="store_true",
+                    help="R2+R3: configuration-model excess-over-null metrics + window-level "
+                         "permutation inference (crisis/calm, food/financial) and exit")
+    ap.add_argument("--n-rewire", type=int, default=20,
+                    help="degree-preserving rewired replicates per graph for --robustness")
+    ap.add_argument("--seed", type=int, default=0, help="RNG seed (config-model null)")
     ap.add_argument("--test", action="store_true", help="run unit tests and exit")
     return ap.parse_args()
 
@@ -900,6 +1333,12 @@ if __name__ == "__main__":
     args = parse_args()
     if args.test:
         run_tests()
+    elif args.topo_reliability:
+        topo_reliability_report(args.data_dir, args.out, edge_quantile=args.edge_quantile)
+    elif args.robustness:
+        robustness_report(args.data_dir, args.out, edge_quantile=args.edge_quantile,
+                          n_rewire=args.n_rewire, seed=args.seed,
+                          stats_file=args.stats_file)
     else:
         build_all(args.data_dir, args.out, stats_file=args.stats_file,
                   edge_quantile=args.edge_quantile, abs_threshold=args.abs_threshold,

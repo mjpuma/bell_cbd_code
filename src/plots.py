@@ -42,6 +42,7 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")                       # headless; never opens a window
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 from matplotlib.figure import Figure
 
 # Reuse the locked threshold definition so Fig (e) cannot diverge from the math.
@@ -464,6 +465,84 @@ def plot_ctx_overlay(stats: pd.DataFrame, null_stats: Optional[pd.DataFrame]) ->
 
 
 # ==========================================================================
+# (P1) Descriptive context exhibits: real S&P 500 index + |return| regimes
+# ==========================================================================
+def plot_sp500_index(index_df: pd.DataFrame,
+                     reg_tbl: Optional[pd.DataFrame] = None) -> Figure:
+    """Real published S&P 500 index level (CRSP spindx) over time, crisis-shaded,
+    with an equal-weighted constituent index (cumulated ewretd, rebased to the same
+    start) overlaid -- the EW line is closer to what the equal-weight pair network
+    'sees' and diverges in the mega-cap-dominated 2021-22 stretch."""
+    name = "fig_r_sp500_index"
+    if _missing(index_df, ("date", "spindx"), name):
+        return _placeholder("S&P 500 index level", "sp500_index missing")
+    d = index_df.copy()
+    d["date"] = pd.to_datetime(d["date"])
+    d = d.sort_values("date")
+    fig, ax = plt.subplots()
+    if reg_tbl is not None and not reg_tbl.empty:
+        _shade_crisis(ax, reg_tbl)
+    ax.plot(d["date"], d["spindx"], color=OKABE["blue"], lw=1.3,
+            label="S&P 500 index (CRSP spindx)")
+    if "ewretd" in d.columns and d["ewretd"].notna().any():
+        ew = (1.0 + d["ewretd"].fillna(0.0)).cumprod()
+        ew = ew / ew.iloc[0] * float(d["spindx"].iloc[0])      # rebase to spindx start
+        ax.plot(d["date"], ew, color=OKABE["orange"], lw=1.1, ls="--",
+                label="equal-weighted constituents (rebased)")
+    ax.set_yscale("log")
+    ax.set_title("S&P 500 index level, 1990-2025")
+    ax.set_xlabel("Date"); ax.set_ylabel("Index level (log scale)")
+    ax.legend(loc="upper left")
+    fig.autofmt_xdate()
+    _caption(fig, f"CRSP daily S&P 500 (spindx); N={len(d):,} trading days. "
+                  "Shaded = crisis windows (VIX/NBER).")
+    fig.tight_layout(rect=(0, 0.03, 1, 1))
+    return fig
+
+
+def plot_abs_return_box(returns: pd.DataFrame, reg_tbl: Optional[pd.DataFrame] = None,
+                        freq: str = "M") -> Figure:
+    """Box-and-whisker of the cross-sectional |daily return| distribution per period
+    (default monthly; pass freq='Q' for the cleaner quarterly view). Visualizes the
+    volatility environment that defines the theta magnitude regimes -- crises are the
+    high-|R| periods, so it doubles as face validity for the regime split."""
+    name = "fig_s_abs_return_box"
+    if _missing(returns, ("date", "ret"), name):
+        return _placeholder("Cross-sectional |return| over time", "returns missing")
+    r = returns[["date", "ret"]].copy()
+    r["date"] = pd.to_datetime(r["date"])
+    r["absret"] = r["ret"].abs() * 100.0                       # percent
+    r = r.dropna(subset=["absret"])
+    r["period"] = r["date"].dt.to_period(freq)
+    groups = [(p, g["absret"].to_numpy()) for p, g in r.groupby("period")]
+    if not groups:
+        return _placeholder("Cross-sectional |return| over time", "no data")
+    periods = [p.to_timestamp() for p, _ in groups]
+    data = [g for _, g in groups]
+    fig, ax = plt.subplots(figsize=(15, 4.5))
+    if reg_tbl is not None and not reg_tbl.empty:
+        _shade_crisis(ax, reg_tbl)
+    positions = mdates.date2num(periods)
+    width = float(np.median(np.diff(positions))) * 0.8 if len(positions) > 1 else 20
+    bp = ax.boxplot(data, positions=positions, widths=width, showfliers=False,
+                    patch_artist=True, manage_ticks=False)
+    for patch in bp["boxes"]:
+        patch.set_facecolor(OKABE["skyblue"]); patch.set_alpha(0.7)
+    for med in bp["medians"]:
+        med.set_color(OKABE["black"])
+    ax.xaxis_date()
+    ax.set_title(f"Cross-sectional |daily return| by {('month' if freq=='M' else freq)}")
+    ax.set_xlabel("Date"); ax.set_ylabel("|daily return| (%)")
+    ax.set_ylim(bottom=0)
+    fig.autofmt_xdate()
+    _caption(fig, f"Boxes = cross-sectional |R| per {('month' if freq=='M' else 'period')} "
+                  f"(whiskers 1.5 IQR, fliers hidden); {len(data):,} periods. "
+                  "High-|R| periods are the crises.")
+    fig.tight_layout(rect=(0, 0.03, 1, 1))
+    return fig
+
+
+# ==========================================================================
 # AGGREGATE-FED variants for the full-span (--partition) run, where the
 # ~5e7-row pair-window frame is never materialized. These consume the compact
 # aggregates emitted by cbd_analysis.analyze_streaming.
@@ -726,6 +805,7 @@ def build_all_streaming(data_dir: str, out_dir: str) -> None:
     elig = _read_optional(os.path.join(data_dir, "window_eligibility"))
     returns = _read_optional(os.path.join(data_dir, "daily_returns"))
     sweep = _read_optional(os.path.join(data_dir, "threshold_sweep"))
+    index_df = _read_optional(os.path.join(data_dir, "sp500_index"))
     reg_tbl = _window_regime_from_shards(shard_dir)
 
     figs = {
@@ -740,6 +820,8 @@ def build_all_streaming(data_dir: str, out_dir: str) -> None:
         "fig_h_sodd_vs_delta": lambda: plot_sodd_vs_delta(scatter),
         "fig_i_ctx_overlay": lambda: plot_ctx_overlay_agg(stat_hist, null_hist),
         "fig_j_threshold_sweep": lambda: plot_threshold_sweep(sweep),
+        "fig_r_sp500_index": lambda: plot_sp500_index(index_df, reg_tbl),
+        "fig_s_abs_return_box": lambda: plot_abs_return_box(returns, reg_tbl, freq="M"),
     }
     for name, fn in figs.items():
         try:
@@ -873,6 +955,11 @@ def run_tests() -> None:
                                                             104: "Tech", 200: "Health",
                                                             201: "Health", 202: "Energy",
                                                             203: "Tech"})),
+        ("r", plot_sp500_index(pd.DataFrame({
+            "date": pd.bdate_range("1990-01-01", periods=60),
+            "spindx": np.linspace(350, 500, 60),
+            "sprtrn": 0.001, "ewretd": 0.001}), window_regime_table(stats))),
+        ("s", plot_abs_return_box(returns, window_regime_table(stats), freq="M")),
     ]
     for tag, fig in checks:
         assert isinstance(fig, Figure), tag

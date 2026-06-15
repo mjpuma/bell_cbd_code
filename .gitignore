@@ -16,8 +16,13 @@ __pycache__/
 .venv/
 venv/
 
+# extracted/derived data dirs (re-derivable; do not commit)
+wrds_sp500_data/
+wrds_sp500_data_w120/
+
 # figures (regenerable from the parquet via src/plots.py)
 figures/
+figures_w120/
 
 # macOS
 .DS_Store

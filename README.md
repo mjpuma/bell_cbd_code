@@ -142,6 +142,42 @@ The reader streams window-by-window, so pointing `--stats-file` at a partitioned
 directory of per-window shards scales to the full panel. The `sector_map` argument
 is a carried hook for a later agricultural node-filter; no filtering is done here.
 
+## Robustness pass (R1–R4) and descriptive figures (P1)
+These hardening steps gate the network findings and add recognizable context.
+
+- **R1 — reliability checkpoint** (`cbd_analysis.py --reliability` then
+  `networks.py --topo-reliability`). The regime-preserving odd/even split-half now
+  reports Spearman-Brown reliability for **s_odd, E00, and pooled** edge weights and
+  emits per-window edge shards into `split_half_edge_weights/`. `--topo-reliability`
+  consumes them for (a) the top-5% **edge-set Jaccard** overlap (is the *identity* of
+  the strongest edges reproducible?) and (b) **half-graph metric correlations** across
+  windows (are the *aggregate* modularity/giant-frac/clustering reproducible?). Writes
+  `topology_reliability.parquet`, `reliability_checkpoint.parquet`, fig q. Full-span
+  verdict: E00 edge SB r = 0.34 (marginal), Jaccard ≈ 0.05 (**fails** — no edge-level
+  claims), but aggregate half-corr is high (mod 0.79, giant 0.93, clust 0.90) → E00
+  **aggregate-metric** claims are supported; specific-edge claims are not.
+- **R2 — configuration-model null** (`networks.py --robustness`, `--n-rewire`). Each
+  topology metric is reported as **excess over a degree-preserving (double-edge-swap)
+  null** plus a z-score in null-SD units, controlling for the node-count/composition
+  shifts that confound modularity & giant-frac across eras. Writes
+  `network_metrics_excess.parquet` and fig u (excess over time).
+- **R3 — window-level inference** (runs inside `--robustness`). Crisis-vs-calm and
+  food-vs-financial permutation tests at the **window level** (windows as the unit) on
+  the excess metrics; pair-level p-values are intentionally dropped (with ~5·10⁷ pairs
+  they are meaningless). Writes `window_level_inference.parquet`.
+- **R4 — window-length sensitivity** (`rebuild_windows.py --window-days 120`). Re-derives
+  `window_eligibility` at 120 td from the on-disk panel (no WRDS re-pull; reuses the
+  extractor's `build_windows`/`compute_eligibility`) into a sibling data dir with the
+  large files symlinked, then re-runs the pipeline there. Confirms thin cells were the
+  reliability bottleneck (E00 edge SB r 0.34 → 0.49) and checks that the giant-component
+  crisis-dissolution, the food-vs-financial modularity gap, and the COVID-vs-Lehman
+  fragmentation contrast survive the longer window.
+- **P1 — descriptive context** (`plots.py`): the real published **S&P 500 index level**
+  (CRSP `crsp.dsp500_v2.spindx`, saved once to `sp500_index.parquet`) crisis-shaded with
+  an equal-weighted-constituent overlay (fig r), and the cross-sectional **|daily return|
+  box-whisker** by month (fig s, `freq` parameter) showing crises are the high-|R|
+  periods. The all-four-metrics small-multiples over time is fig t (raw) / fig u (excess).
+
 ## Crisis taxonomy (overlay)
 `config/crises.csv` lists named crisis sub-periods (1990–2025) with a type label
 (financial/food/energy/mixed) for cross-crisis comparison. It is loaded via the
