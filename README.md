@@ -14,10 +14,12 @@ bell_cbd_code/
 │   ├── extract_wrds_sp500.py   # Stage 1: pull data from WRDS (CRSP CIZ/v2)
 │   ├── cbd_analysis.py         # Stage 2: CbD statistics per pair/window + theta sweep
 │   ├── plots.py                # Stage 3: figures from the parquet (offline)
-│   └── networks.py             # Stage 3: network topology + MR-QAP (offline)
+│   ├── networks.py             # Stage 3: network topology + MR-QAP (offline)
+│   └── inspect_wrds_data.py    # read-only helper: preview/summarize/export the parquet
 ├── config/
 │   └── crises.csv              # named crisis taxonomy (overlay, NOT the binary label)
 ├── wrds_sp500_data/            # pipeline parquet outputs land here (gitignored)
+├── exports/                    # CSV exports from inspect_wrds_data.py (gitignored)
 ├── figures/                    # generated figures (gitignored)
 └── docs/
     ├── cbd_sp500_analysis.pdf  # the spec (read first)
@@ -31,6 +33,32 @@ bell_cbd_code/
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
+
+## Inspecting the data (read-only sanity checks)
+`src/inspect_wrds_data.py` is a standalone helper for poking at the extracted
+parquet without touching the pipeline. It never connects to WRDS — it only reads
+the files already in `wrds_sp500_data/`. Good first stop for anyone exploring the
+data.
+```
+python src/inspect_wrds_data.py list                        # all datasets: size, rows, cols
+python src/inspect_wrds_data.py info daily_returns          # schema, dtypes, date ranges
+python src/inspect_wrds_data.py head membership -n 20       # first N rows
+python src/inspect_wrds_data.py sample daily_returns -n 10  # random sample
+python src/inspect_wrds_data.py stats daily_returns         # describe() + null counts
+python src/inspect_wrds_data.py csv membership              # export CSV -> exports/ (for Excel)
+python src/inspect_wrds_data.py --data-dir wrds_sp500_data_w120 list   # the w120 variant
+```
+CSV exports land in `exports/` (gitignored). Several datasets are millions of rows
+(`daily_returns` ~7M; the sharded `pair_window_stats` / `split_half_edge_weights`
+are 50M+), well past Excel's ~1M-row limit, so `csv` refuses to dump those unless
+you pass `--max-rows N` (a slice) or `--force` (the whole thing). Importable too:
+`from src.inspect_wrds_data import load; df = load("daily_returns")`.
+
+### Getting the data onto another machine
+The data folders are gitignored and large (`wrds_sp500_data/` is ~1.6 GB), so they
+are **not** in the repo. Clone the code from GitHub, then receive the
+`wrds_sp500_data/` folder out-of-band (zip + Drive/Dropbox) and drop it into the
+repo root. Code is versioned in git; data is delivered separately.
 
 ## Stage 1 — extract (one-time, network-bound)
 First run prompts for your WRDS username/password and offers to create

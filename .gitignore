@@ -20,6 +20,9 @@ venv/
 wrds_sp500_data/
 wrds_sp500_data_w120/
 
+# CSV exports from src/inspect_wrds_data.py (re-generable; do not commit)
+exports/
+
 # figures (regenerable from the parquet via src/plots.py)
 figures/
 figures_w120/
