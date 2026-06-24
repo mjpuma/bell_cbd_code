@@ -24,13 +24,14 @@ WHERE IT RUNS
     have no outbound internet), write parquet to shared storage, then run the
     heavy CbD analysis on compute nodes offline.
 
-OUTPUTS  (parquet, into OUTPUT_DIR)
------------------------------------
-  membership.parquet          SPX membership spells: permno, mbrstartdt, mbrenddt
-  daily_returns.parquet       panel: permno, date, ret, [prc, vol, shrout]
-  trading_calendar.parquet    distinct trading dates (the NYSE calendar)
-  window_eligibility.parquet  window_id, win_start, win_end, permno (continuously resident)
-  identifiers.parquet         best-effort permno -> permco/ticker/name (if available)
+OUTPUTS  (parquet)
+------------------
+Raw WRDS pulls land directly in OUTPUT_DIR; derived artifacts go to OUTPUT_DIR/processed:
+  membership.parquet                  SPX membership spells: permno, mbrstartdt, mbrenddt
+  daily_returns.parquet               panel: permno, date, ret, [prc, vol, shrout]
+  trading_calendar.parquet            distinct trading dates (the NYSE calendar)
+  identifiers.parquet                 best-effort permno -> permco/ticker/name (if available)
+  processed/window_eligibility.parquet  window_id, win_start, win_end, permno (continuously resident)
 
 DEPENDENCIES
 ------------
@@ -242,13 +243,17 @@ def compute_eligibility(membership, windows, trading_days, frac):
 # --------------------------------------------------------------------------
 # IO
 # --------------------------------------------------------------------------
-def save(df, name):
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    path = os.path.join(OUTPUT_DIR, name + ".parquet")
+def save(df, name, subdir=None):
+    """Write `name` under OUTPUT_DIR. Raw WRDS pulls go to OUTPUT_DIR; derived
+    artifacts (e.g. the rolling-window eligibility) pass subdir='processed' so they
+    live in OUTPUT_DIR/processed, keeping the raw data folder clean."""
+    out = os.path.join(OUTPUT_DIR, subdir) if subdir else OUTPUT_DIR
+    os.makedirs(out, exist_ok=True)
+    path = os.path.join(out, name + ".parquet")
     try:
         df.to_parquet(path, index=False)
     except Exception as e:            # noqa: BLE001  (pyarrow missing, etc.)
-        path = os.path.join(OUTPUT_DIR, name + ".csv")
+        path = os.path.join(out, name + ".csv")
         df.to_csv(path, index=False)
         log.warning(f"  parquet unavailable ({e}); wrote CSV instead")
     log.info(f"  saved {name}: {len(df):,} rows -> {path}")
@@ -287,7 +292,7 @@ def main():
             return
 
         elig = compute_eligibility(membership, windows, list(calendar.date), COMEMBER_FRAC)
-        save(elig, "window_eligibility")
+        save(elig, "window_eligibility", subdir="processed")   # derived -> processed/
 
         per_win = elig.groupby("window_id").permno.nunique()
         med = int(per_win.median())

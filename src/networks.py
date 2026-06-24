@@ -552,9 +552,9 @@ def robustness_report(data_dir: str, out_dir: str, edge_quantile: float = 0.05,
     if excess.empty:
         log.error("robustness_report: no windows; aborting.")
         return
-    _save(excess, os.path.join(data_dir, "network_metrics_excess.parquet"))
+    _save(excess, _out(data_dir, "network_metrics_excess.parquet"))
     wli = window_level_inference(excess, kind="e00")
-    _save(wli, os.path.join(data_dir, "window_level_inference.parquet"))
+    _save(wli, _out(data_dir, "window_level_inference.parquet"))
     try:
         fig = plot_all_metrics_over_time(excess, value_suffix="_excess")
         save_figure(fig, out_dir, "fig_u_excess_metrics_over_time"); plt.close(fig)
@@ -563,11 +563,12 @@ def robustness_report(data_dir: str, out_dir: str, edge_quantile: float = 0.05,
 
 
 def _resolve_stats(data_dir: str) -> str:
-    for cand in ("pair_window_stats", "pair_window_stats.parquet"):
-        p = os.path.join(data_dir, cand)
-        if os.path.isdir(p) or os.path.exists(p):
-            return p
-    return os.path.join(data_dir, "pair_window_stats")
+    for base in (os.path.join(data_dir, "processed"), data_dir):
+        for cand in ("pair_window_stats", "pair_window_stats.parquet"):
+            p = os.path.join(base, cand)
+            if os.path.isdir(p) or os.path.exists(p):
+                return p
+    return os.path.join(data_dir, "processed", "pair_window_stats")
 
 
 def _load_taxonomy_safe() -> Optional[pd.DataFrame]:
@@ -1050,7 +1051,7 @@ def build_all(data_dir: str, out_dir: str, stats_file: Optional[str] = None,
               reliability_file: Optional[str] = None,
               gate_node_subsample: Optional[int] = 60) -> None:
     set_style()
-    stats_path = stats_file or os.path.join(data_dir, "pair_window_stats")
+    stats_path = stats_file or _resolve_stats(data_dir)
     if not (os.path.isdir(stats_path) or os.path.exists(stats_path)
             or os.path.exists(stats_path + ".parquet")):
         log.error(f"{stats_path}: pair_window_stats not found; run cbd_analysis.py first.")
@@ -1059,7 +1060,7 @@ def build_all(data_dir: str, out_dir: str, stats_file: Optional[str] = None,
     taxonomy = load_crisis_taxonomy()
     metrics = window_network_metrics(stats_path, edge_quantile=edge_quantile,
                                      abs_threshold=abs_threshold, taxonomy=taxonomy)
-    mpath = os.path.join(data_dir, "network_metrics.parquet")
+    mpath = _out(data_dir, "network_metrics.parquet")
     _save(metrics, mpath)
     log.info(f"wrote {len(metrics):,} network-metric rows -> {mpath}")
 
@@ -1068,11 +1069,11 @@ def build_all(data_dir: str, out_dir: str, stats_file: Optional[str] = None,
     if run_mrqap:
         qap = qap_hierarchy(stats_path, n_perm=mrqap_nperm, max_windows=mrqap_windows,
                             node_subsample=gate_node_subsample)
-        qpath = os.path.join(data_dir, "network_qap.parquet")
+        qpath = _out(data_dir, "network_qap.parquet")
         _save(qap, qpath)
         log.info(f"wrote {len(qap):,} QAP rows -> {qpath}")
         # null baseline (PRIMARY) + reliability ceiling (SUPPORTING)
-        null_path = null_stats_file or os.path.join(data_dir, "classical_null_gate_stats")
+        null_path = null_stats_file or _resolve_in(data_dir, "classical_null_gate_stats")
         null_qap = pd.DataFrame()
         if os.path.isdir(null_path) or os.path.exists(null_path) \
                 or os.path.exists(null_path + ".parquet"):
@@ -1085,7 +1086,7 @@ def build_all(data_dir: str, out_dir: str, stats_file: Optional[str] = None,
         reliability = _read_optional(reliability_file
                                      or os.path.join(data_dir, "s_odd_reliability"))
         summary = gate_null_relative_summary(qap, null_qap, reliability)
-        _save(pd.DataFrame([summary]), os.path.join(data_dir, "network_gate_summary.parquet"))
+        _save(pd.DataFrame([summary]), _out(data_dir, "network_gate_summary.parquet"))
 
     figs = {
         "fig_k_network_metrics_crisis_calm": lambda: plot_network_metrics_crisis_calm(metrics),
@@ -1114,16 +1115,16 @@ def topo_reliability_report(data_dir: str, out_dir: str, edge_quantile: float = 
     compute the topology reliability (Jaccard + half-graph metric correlation), write
     artifacts, render fig (q), and return the per-kind summary."""
     set_style()
-    edges = edges_file or os.path.join(data_dir, "split_half_edge_weights")
+    edges = edges_file or _resolve_in(data_dir, "split_half_edge_weights")
     edge_rel = topology_reliability(edges, edge_quantile=edge_quantile)
     if edge_rel.empty:
         log.error("topo_reliability_report: no reliability rows; run "
                   "`cbd_analysis.py --reliability` first to emit split_half_edge_weights.")
         return pd.DataFrame()
-    _save(edge_rel, os.path.join(data_dir, "topology_reliability.parquet"))
+    _save(edge_rel, _out(data_dir, "topology_reliability.parquet"))
     weight_rel = _read_optional(os.path.join(data_dir, "s_odd_reliability"))
     summary = reliability_summary(edge_rel, weight_rel)
-    _save(summary, os.path.join(data_dir, "reliability_checkpoint.parquet"))
+    _save(summary, _out(data_dir, "reliability_checkpoint.parquet"))
     e00 = summary[summary["graph"] == "e00"]
     cleared = bool(len(e00) and (
         (e00["mean_edge_sb_r"].iloc[0] if "mean_edge_sb_r" in e00 else 0) >= 0.3
@@ -1138,15 +1139,43 @@ def topo_reliability_report(data_dir: str, out_dir: str, edge_quantile: float = 
     return summary
 
 
+def _processed_candidates(path: str):
+    """Yield `path` and the same basename under a sibling `processed/` subdir, so a
+    read of <data_dir>/<name> also finds <data_dir>/processed/<name>."""
+    yield path
+    d, b = os.path.split(path)
+    yield os.path.join(d, "processed", b)
+
+
 def _read_optional(path: str) -> Optional[pd.DataFrame]:
-    for ext in (".parquet", ".csv"):
-        p = path if path.endswith(ext) else path + ext
-        if os.path.exists(p):
-            return pd.read_parquet(p) if p.endswith(".parquet") else pd.read_csv(p)
+    for cand in _processed_candidates(path):
+        for ext in (".parquet", ".csv"):
+            p = cand if cand.endswith(ext) else cand + ext
+            if os.path.exists(p):
+                return pd.read_parquet(p) if p.endswith(".parquet") else pd.read_csv(p)
     return None
 
 
+def _out(data_dir: str, name: str) -> str:
+    """Write path for a derived output: <data_dir>/processed/<name>, dir created."""
+    d = os.path.join(data_dir, "processed")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, name)
+
+
+def _resolve_in(data_dir: str, name: str) -> str:
+    """Existing input path for `name` (file or dir), processed/ first then raw;
+    falls back to the processed-dir path if nothing exists yet."""
+    for base in (os.path.join(data_dir, "processed"), data_dir):
+        for cand in (name, name + ".parquet"):
+            p = os.path.join(base, cand)
+            if os.path.isdir(p) or os.path.exists(p):
+                return p
+    return os.path.join(data_dir, "processed", name)
+
+
 def _save(df: pd.DataFrame, path: str) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     try:
         df.to_parquet(path, index=False)
     except Exception:                                      # noqa: BLE001

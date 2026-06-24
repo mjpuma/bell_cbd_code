@@ -760,12 +760,26 @@ def plot_violation_rates_by_sector(stats: pd.DataFrame, sector_map: dict) -> Fig
 # ==========================================================================
 # I/O + driver
 # ==========================================================================
+# Layout: raw WRDS inputs in <data_dir>; analysis outputs in <data_dir>/processed.
+# Reads transparently check both so plots work regardless of where a file landed.
 def _read_optional(path: str) -> Optional[pd.DataFrame]:
-    for ext in (".parquet", ".csv"):
-        p = path if path.endswith(ext) else path + ext
-        if os.path.exists(p):
-            return pd.read_parquet(p) if p.endswith(".parquet") else pd.read_csv(p)
+    d, b = os.path.split(path)
+    for cand in (path, os.path.join(d, "processed", b)):
+        for ext in (".parquet", ".csv"):
+            p = cand if cand.endswith(ext) else cand + ext
+            if os.path.exists(p):
+                return pd.read_parquet(p) if p.endswith(".parquet") else pd.read_csv(p)
     return None
+
+
+def _resolve_in(data_dir: str, name: str) -> str:
+    """Existing input path for `name` (file or dir), processed/ first then raw."""
+    for base in (os.path.join(data_dir, "processed"), data_dir):
+        for cand in (name, name + ".parquet"):
+            p = os.path.join(base, cand)
+            if os.path.isdir(p) or os.path.exists(p):
+                return p
+    return os.path.join(data_dir, "processed", name)
 
 
 def load_sector_map(data_dir: str) -> dict:
@@ -796,7 +810,7 @@ def build_all_streaming(data_dir: str, out_dir: str) -> None:
     """Full-span figure build that consumes the compact aggregates from
     analyze_streaming (never loads the ~5e7-row pair-window frame)."""
     set_style()
-    shard_dir = os.path.join(data_dir, "pair_window_stats")
+    shard_dir = _resolve_in(data_dir, "pair_window_stats")
     headline = _read_optional(os.path.join(data_dir, "headline_rates"))
     stat_hist = _read_optional(os.path.join(data_dir, "stat_hist"))
     cell_summary = _read_optional(os.path.join(data_dir, "cell_summary"))

@@ -50,7 +50,9 @@ def rebuild(src: str, dst: str, window_days: int, step_days: int) -> None:
         raise SystemExit("no full-length windows; widen the panel or shorten window")
 
     elig = compute_eligibility(membership, windows, cal_dates, COMEMBER_FRAC)
-    out = os.path.join(dst, "window_eligibility.parquet")
+    proc = os.path.join(dst, "processed")          # derived artifact -> processed/
+    os.makedirs(proc, exist_ok=True)
+    out = os.path.join(proc, "window_eligibility.parquet")
     elig.to_parquet(out, index=False)
     per_win = elig.groupby("window_id").permno.nunique()
     log.info(f"eligible names/window: median {int(per_win.median())}, "

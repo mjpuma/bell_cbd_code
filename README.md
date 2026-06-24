@@ -15,10 +15,14 @@ bell_cbd_code/
 │   ├── cbd_analysis.py         # Stage 2: CbD statistics per pair/window + theta sweep
 │   ├── plots.py                # Stage 3: figures from the parquet (offline)
 │   ├── networks.py             # Stage 3: network topology + MR-QAP (offline)
-│   └── inspect_wrds_data.py    # read-only helper: preview/summarize/export the parquet
+│   └── inspect_wrds_data.py    # read-only viewer for the ORIGINAL WRDS data
 ├── config/
 │   └── crises.csv              # named crisis taxonomy (overlay, NOT the binary label)
-├── wrds_sp500_data/            # pipeline parquet outputs land here (gitignored)
+├── wrds_sp500_data/            # (gitignored) raw WRDS pull at the top level:
+│   │                           #   daily_returns, membership, identifiers,
+│   │                           #   trading_calendar, sp500_index
+│   └── processed/              # everything the pipeline derives (window_eligibility,
+│                               #   pair_window_stats, network_*, aggregates, ...)
 ├── exports/                    # CSV exports from inspect_wrds_data.py (gitignored)
 ├── figures/                    # generated figures (gitignored)
 └── docs/
@@ -34,31 +38,37 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Inspecting the data (read-only sanity checks)
-`src/inspect_wrds_data.py` is a standalone helper for poking at the extracted
-parquet without touching the pipeline. It never connects to WRDS — it only reads
-the files already in `wrds_sp500_data/`. Good first stop for anyone exploring the
-data.
+## Data layout: raw vs. processed
+`wrds_sp500_data/` (gitignored) is split in two:
+- **top level = raw WRDS pull** (what you'd hand to a collaborator): `daily_returns`,
+  `membership`, `identifiers`, `trading_calendar`, `sp500_index`.
+- **`processed/` = everything the pipeline derives**: `window_eligibility`,
+  `pair_window_stats/`, the streaming aggregates, `network_*`, reliability, sweep, etc.
+
+Every script reads raw inputs from `--data-dir` and writes derived outputs to
+`--data-dir/processed` (reads transparently search both, so older single-folder
+layouts still work). To keep raw and processed separate you only ever pass
+`--data-dir wrds_sp500_data`.
+
+## Inspecting the original data (read-only)
+`src/inspect_wrds_data.py` is a tiny viewer for the **raw** files only (it ignores
+`processed/`). It never connects to WRDS and never writes into the data folder.
 ```
-python src/inspect_wrds_data.py list                        # all datasets: size, rows, cols
-python src/inspect_wrds_data.py info daily_returns          # schema, dtypes, date ranges
-python src/inspect_wrds_data.py head membership -n 20       # first N rows
-python src/inspect_wrds_data.py sample daily_returns -n 10  # random sample
-python src/inspect_wrds_data.py stats daily_returns         # describe() + null counts
-python src/inspect_wrds_data.py csv membership              # export CSV -> exports/ (for Excel)
-python src/inspect_wrds_data.py --data-dir wrds_sp500_data_w120 list   # the w120 variant
+python src/inspect_wrds_data.py list                # raw files: size, rows, cols
+python src/inspect_wrds_data.py view daily_returns  # columns, types, date range, first rows
+python src/inspect_wrds_data.py view membership -n 20
+python src/inspect_wrds_data.py csv membership      # export CSV -> exports/ (for Excel)
 ```
-CSV exports land in `exports/` (gitignored). Several datasets are millions of rows
-(`daily_returns` ~7M; the sharded `pair_window_stats` / `split_half_edge_weights`
-are 50M+), well past Excel's ~1M-row limit, so `csv` refuses to dump those unless
-you pass `--max-rows N` (a slice) or `--force` (the whole thing). Importable too:
+CSV exports land in `exports/` (gitignored). `daily_returns` is ~7M rows (past
+Excel's ~1M limit), so `csv` exports the first 100k by default; use `--max-rows N`
+or `--force` for more. Importable too:
 `from src.inspect_wrds_data import load; df = load("daily_returns")`.
 
 ### Getting the data onto another machine
-The data folders are gitignored and large (`wrds_sp500_data/` is ~1.6 GB), so they
-are **not** in the repo. Clone the code from GitHub, then receive the
-`wrds_sp500_data/` folder out-of-band (zip + Drive/Dropbox) and drop it into the
-repo root. Code is versioned in git; data is delivered separately.
+The data folders are gitignored and large, so they are **not** in the repo. Clone
+the code from GitHub, then receive the data out-of-band (zip + Drive/Dropbox) and
+drop it into the repo root. To share just the raw daily returns with a student,
+send only the top-level files (skip `processed/`) — that's ~84 MB instead of ~1.6 GB.
 
 ## Stage 1 — extract (one-time, network-bound)
 First run prompts for your WRDS username/password and offers to create
@@ -67,15 +77,16 @@ script for a short laptop smoke test, then set it to `False` for the full pull.
 ```
 python src/extract_wrds_sp500.py
 ```
-Writes to `data/`: membership, daily_returns, trading_calendar,
-window_eligibility (parquet). See the HPC / Empire AI notes at the bottom of the
+Writes the raw pull (membership, daily_returns, trading_calendar, identifiers,
+sp500_index) to `wrds_sp500_data/`, and the derived `window_eligibility` to
+`wrds_sp500_data/processed/`. See the HPC / Empire AI notes at the bottom of the
 script (run extraction on a login node; compute nodes usually have no egress).
 
 ## Stage 2 — analyze (offline, iterative)
 ```
 python src/cbd_analysis.py --test           # run unit tests (math must stay green)
 python src/cbd_analysis.py --sample 3        # first 3 windows, quick check
-python src/cbd_analysis.py                   # full run -> wrds_sp500_data/pair_window_stats.parquet
+python src/cbd_analysis.py                   # full run -> wrds_sp500_data/processed/pair_window_stats.parquet
 
 # crisis/calm labels from an EXTERNAL indicator (never from the pairs' returns):
 python src/cbd_analysis.py --crisis-source nber                 # built-in NBER recessions
@@ -89,20 +100,20 @@ python src/cbd_analysis.py --null --null-max-pairs 5000
 python src/cbd_analysis.py --sweep --crisis-source nber   # bare --sweep = default set
 #   default {0.25,0.40,0.42,0.45,0.48,0.50,0.75,0.90,0.95} — a fine in-band grid
 #   (0.40–0.50) plus boundary points; or pass --sweep "0.25,0.5,0.9".
-#   -> wrds_sp500_data/threshold_sweep.parquet (strict N_min headline; relaxed-N_min
+#   -> wrds_sp500_data/processed/threshold_sweep.parquet (strict N_min headline; relaxed-N_min
 #      DIAGNOSTIC at high quantiles, reported NULL-RELATIVE: classical-null ctx>0 and
 #      a cell-size-matched finite-N ctx>0 floor next to the empirical relaxed rate).
 
 # s_odd split-half reliability (the MR-QAP gate's reliability ceiling):
-python src/cbd_analysis.py --reliability      # -> s_odd_reliability.parquet
+python src/cbd_analysis.py --reliability      # -> processed/s_odd_reliability.parquet
 
 # classical-null per-window-dense stats for the networks MR-QAP null baseline:
 python src/cbd_analysis.py --null-gate-stats --gate-windows 6 --gate-nodes 60
-#   -> classical_null_gate_stats.parquet (same schema, source='classical_null').
+#   -> processed/classical_null_gate_stats.parquet (same schema, source='classical_null').
 
 # FULL 1990-2025 run (memory-safe; the monolithic frame is ~5e7 rows / ~13GB):
 python src/cbd_analysis.py --partition          # streams one shard per window
-#   -> wrds_sp500_data/pair_window_stats/shard_NNNNN.parquet  (partition-by-window)
+#   -> wrds_sp500_data/processed/pair_window_stats/shard_NNNNN.parquet  (partition-by-window)
 #   plus compact aggregates beside it (the per-pair frame is NEVER held in memory):
 #     headline_rates.parquet      per-regime naive(s_odd>2) / CbD(ctx>0) running tallies
 #     stat_hist.parquet           per-(var,regime) histograms of s_odd/delta/ctx

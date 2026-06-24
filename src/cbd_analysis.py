@@ -291,14 +291,37 @@ def run_window(window_id, win_start, win_end, permnos, ret_wide, n_min, theta_q=
 # ==========================================================================
 # I/O  (wired to the extractor's exact schema)
 # ==========================================================================
+# Layout convention: raw WRDS inputs live in <data_dir>; everything this pipeline
+# derives (window_eligibility, pair_window_stats, aggregates, network outputs, ...)
+# lives in <data_dir>/processed. Reads search both (so the split is transparent and
+# old single-folder layouts still work); writes always go to <data_dir>/processed.
+def processed_dir(data_dir):
+    """Return <data_dir>/processed, creating it if needed."""
+    d = os.path.join(data_dir, "processed")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def resolve_input(data_dir, name):
+    """Path to an existing input `name` (file or dir), searching processed/ first
+    then the raw dir. Falls back to the processed-dir path if nothing exists yet."""
+    for base in (os.path.join(data_dir, "processed"), data_dir):
+        for cand in (name, name + ".parquet", name + ".csv"):
+            p = os.path.join(base, cand)
+            if os.path.exists(p):
+                return p
+    return os.path.join(data_dir, "processed", name)
+
+
 def _read(data_dir, name):
-    p = os.path.join(data_dir, name + ".parquet")
-    if os.path.exists(p):
-        return pd.read_parquet(p)
-    p = os.path.join(data_dir, name + ".csv")
-    if os.path.exists(p):
-        return pd.read_csv(p, parse_dates=True)
-    raise FileNotFoundError(f"missing {name}.parquet/.csv in {data_dir}")
+    for base in (data_dir, os.path.join(data_dir, "processed")):
+        p = os.path.join(base, name + ".parquet")
+        if os.path.exists(p):
+            return pd.read_parquet(p)
+        p = os.path.join(base, name + ".csv")
+        if os.path.exists(p):
+            return pd.read_csv(p, parse_dates=True)
+    raise FileNotFoundError(f"missing {name}.parquet/.csv in {data_dir} or {data_dir}/processed")
 
 
 def load_data(data_dir):
@@ -978,7 +1001,7 @@ def analyze_streaming(data_dir, out_dir, n_min, *, sample=None, crisis_source=No
                                 threshold=crisis_threshold)
     shard_dir = out_dir
     os.makedirs(shard_dir, exist_ok=True)
-    agg_dir = data_dir                                     # aggregates live beside other outputs
+    agg_dir = processed_dir(data_dir)                      # aggregates live in processed/
 
     tally = defaultdict(lambda: np.zeros(4))               # regime -> [total,valid,naive,cbd]
     hist = defaultdict(lambda: {v: np.zeros(len(e) - 1) for v, e in HIST_EDGES.items()})
@@ -1733,14 +1756,18 @@ def run_tests():
 
 def parse_args():
     ap = argparse.ArgumentParser(description="CbD analysis over extractor parquet outputs.")
-    ap.add_argument("--data-dir", default="wrds_sp500_data")
-    ap.add_argument("--out", default="wrds_sp500_data/pair_window_stats.parquet")
+    ap.add_argument("--data-dir", default="wrds_sp500_data",
+                    help="raw WRDS inputs; derived outputs go to <data-dir>/processed")
+    ap.add_argument("--out", default=None,
+                    help="output path (default <data-dir>/processed/pair_window_stats.parquet)")
     ap.add_argument("--partition", action="store_true",
                     help="memory-safe full-span mode: write per-window shards + compact "
-                         "aggregates into a DIRECTORY (default wrds_sp500_data/pair_window_stats) "
-                         "instead of one monolithic frame. Use for the full 1990-2025 run.")
-    ap.add_argument("--partition-out", default="wrds_sp500_data/pair_window_stats",
-                    help="output directory for --partition shards + aggregates")
+                         "aggregates into a DIRECTORY (default "
+                         "<data-dir>/processed/pair_window_stats) instead of one "
+                         "monolithic frame. Use for the full 1990-2025 run.")
+    ap.add_argument("--partition-out", default=None,
+                    help="output directory for --partition shards + aggregates "
+                         "(default <data-dir>/processed/pair_window_stats)")
     ap.add_argument("--null-pairs-per-window", type=int, default=400,
                     help="per-window cap on the streamed deflation-null sample (--partition)")
     ap.add_argument("--no-null-stream", action="store_true",
@@ -1799,7 +1826,8 @@ if __name__ == "__main__":
                               crisis_threshold=args.crisis_threshold, sample=args.sample,
                               relaxed_n_min=args.relaxed_n_min, relaxed_quantiles=relaxed,
                               null_relative=not args.no_sweep_null, seed=args.seed)
-        sweep_out = args.sweep_out or os.path.join(args.data_dir, "threshold_sweep.parquet")
+        sweep_out = args.sweep_out or os.path.join(processed_dir(args.data_dir),
+                                                    "threshold_sweep.parquet")
         try:
             sw.to_parquet(sweep_out, index=False)
         except Exception:                                  # noqa: BLE001
@@ -1807,12 +1835,12 @@ if __name__ == "__main__":
         log.info(f"wrote threshold sweep -> {sweep_out}")
     elif args.reliability:
         d = load_data(args.data_dir)
-        edges_out = os.path.join(args.data_dir, "split_half_edge_weights")
+        edges_out = os.path.join(processed_dir(args.data_dir), "split_half_edge_weights")
         rel = s_odd_split_half_reliability(
             d["window_eligibility"], d["daily_returns"], n_min=args.n_min,
             theta_q=args.theta_quantile, sample=args.sample, seed=args.seed,
             emit_edges_path=edges_out)
-        out = os.path.join(args.data_dir, "s_odd_reliability.parquet")
+        out = os.path.join(processed_dir(args.data_dir), "s_odd_reliability.parquet")
         try:
             rel.to_parquet(out, index=False)
         except Exception:                                  # noqa: BLE001
@@ -1820,25 +1848,29 @@ if __name__ == "__main__":
         log.info(f"wrote s_odd reliability -> {out}")
     elif args.null_gate_stats:
         d = load_data(args.data_dir)
-        stats_path = os.path.join(args.data_dir, "pair_window_stats")
+        stats_path = resolve_input(args.data_dir, "pair_window_stats")
         nd = emit_null_gate_stats(stats_path, d["daily_returns"],
                                   n_windows=args.gate_windows, n_nodes=args.gate_nodes,
                                   theta_q=args.theta_quantile, n_min=args.n_min,
                                   seed=args.seed)
-        out = os.path.join(args.data_dir, "classical_null_gate_stats.parquet")
+        out = os.path.join(processed_dir(args.data_dir), "classical_null_gate_stats.parquet")
         try:
             nd.to_parquet(out, index=False)
         except Exception:                                  # noqa: BLE001
             out = out.replace(".parquet", ".csv"); nd.to_csv(out, index=False)
         log.info(f"wrote {len(nd):,} null-gate rows -> {out}")
     elif args.partition:
-        analyze_streaming(args.data_dir, args.partition_out, args.n_min,
+        partition_out = args.partition_out or os.path.join(
+            processed_dir(args.data_dir), "pair_window_stats")
+        analyze_streaming(args.data_dir, partition_out, args.n_min,
                           sample=args.sample, crisis_source=args.crisis_source,
                           crisis_threshold=args.crisis_threshold,
                           theta_q=args.theta_quantile, run_null=not args.no_null_stream,
                           null_pairs_per_window=args.null_pairs_per_window, seed=args.seed)
     else:
-        analyze(args.data_dir, args.out, args.n_min,
+        out = args.out or os.path.join(processed_dir(args.data_dir),
+                                       "pair_window_stats.parquet")
+        analyze(args.data_dir, out, args.n_min,
                 sample=args.sample, crisis_source=args.crisis_source,
                 crisis_threshold=args.crisis_threshold, run_null=args.null,
                 null_out=args.null_out, null_max_pairs=args.null_max_pairs,
